@@ -193,6 +193,10 @@ class BrowserSession {
       'timeout': timeout.inMilliseconds,
     }, timeout);
     if (response['exceptionDetails'] != null) {
+      final details = response['exceptionDetails'].toString();
+      if (RegExp(r'timed out|timeout|terminated', caseSensitive: false).hasMatch(details)) {
+        throw TimeoutException('浏览器 Runtime.evaluate 执行超时。页面: $_activeUrl');
+      }
       throw StateError('浏览器 Runtime.evaluate 脚本执行失败。页面: $_activeUrl');
     }
     return response['result']?['value'];

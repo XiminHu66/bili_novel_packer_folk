@@ -150,10 +150,12 @@ void main() {
         authCalls++;
         request.response.statusCode = 403;
         request.response.write('<html><body>Denied</body></html>');
-      } else {
+      } else if (request.uri.path == '/transient') {
         transientCalls++;
         request.response.statusCode = transientCalls == 1 ? 503 : 200;
         request.response.write('<html><body><div id="acontent"><p>Recovered</p></div></body></html>');
+      } else {
+        request.response.statusCode = 204;
       }
       await request.response.close();
     });
