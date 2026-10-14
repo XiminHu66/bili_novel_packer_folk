@@ -8,3 +8,8 @@ build/
 pubspec.lock
 
 bili_novel.log
+.bili-cache-v1/
+browser-profile/
+dist/
+*.epub
+*.epub.tmp

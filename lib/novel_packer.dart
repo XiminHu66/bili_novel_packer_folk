@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:bili_novel_packer/local/download_cache.dart';
+import 'package:bili_novel_packer/light_novel/bili_novel/bili_novel_source.dart';
 
 import 'package:bili_novel_packer/assets/assets.dart';
 import 'package:bili_novel_packer/console/console.dart';
@@ -15,11 +17,16 @@ import 'package:bili_novel_packer/util/html_util.dart';
 import 'package:bili_novel_packer/util/sequence.dart';
 import 'package:bili_novel_packer/util/volume_util.dart';
 import 'package:html/dom.dart';
+import 'package:html/parser.dart';
 
 class NovelPacker {
   final LightNovelSource source;
 
-  NovelPacker(this.source);
+  final DownloadCache cache;
+  final bool textOnly;
+  final bool offline;
+  NovelPacker(this.source, {DownloadCache? cache, this.textOnly = false,
+      this.offline = false}) : cache = cache ?? DownloadCache();
 
   Future<void> packVolume({
     required LightNovelSource source,
@@ -37,6 +44,7 @@ class NovelPacker {
 
     Sequence chapterSeq = Sequence();
     Sequence imageSeq = Sequence();
+    try {
     for (var chapter in volume.chapters) {
       var doc = await _resolveChapter(
         chapter: chapter,
@@ -54,6 +62,10 @@ class NovelPacker {
         title: chapter.chapterName,
         chapterContent: html,
       );
+    }
+    } catch (_) {
+      if (chapterSeq.nowVal > 0) packer.pack(partial: true);
+      rethrow;
     }
     // 设置封面
     await _resolveCover(
@@ -113,9 +125,10 @@ class NovelPacker {
         ? null
         : await _downloadImageByUrl(novel.coverUrl!);
     if (coverData != null && coverData.isNotEmpty) {
+      final format = _imageFormat(coverData);
       String coverId = imageSeq.next.toString().padLeft(6, '0');
-      String coverName = "images/$coverId.jpg";
-      packer.addImage(name: "OEBPS/$coverName", data: coverData);
+      String coverName = "images/$coverId.${format.$1}";
+      packer.addImage(name: "OEBPS/$coverName", data: coverData, mediaType: format.$2);
       packer.cover = coverName;
     }
 
@@ -123,10 +136,12 @@ class NovelPacker {
       packer.addStylesheet(styleCss());
     }
 
+    try {
     for (Volume volume in option.selectedVolumes) {
       logger.i("开始处理: ${volume.volumeName}");
       console.writeLine("正在处理: ${volume.volumeName}");
       NavPoint volumeNavPoint = NavPoint(volume.volumeName);
+      packer.addNavPoint(volumeNavPoint);
 
       for (var i = 0; i < volume.chapters.length; i++) {
         var chapter = volume.chapters[i];
@@ -153,8 +168,11 @@ class NovelPacker {
           volumeNavPoint.src = name;
         }
       }
-      packer.addNavPoint(volumeNavPoint);
       logger.i("处理完成: ${volume.volumeName}");
+    }
+    } catch (_) {
+      if (chapterSeq.nowVal > 0) packer.pack(partial: true);
+      rethrow;
     }
     packer.pack();
     logger.i("EPUB file: ${packer.absolutePath}");
@@ -182,7 +200,37 @@ class NovelPacker {
     required Sequence imageSeq,
     LightNovelCoverDetector? detector,
   }) async {
-    Document doc = await source.getNovelChapter(chapter);
+    console.writeLine('正在读取章节: ${chapter.chapterName}');
+    logger.i('Chapter: ${chapter.chapterName}, URL: ${chapter.chapterUrl}');
+    final url = chapter.chapterUrl ??
+        'chapter:${chapter.volume.catalog.novel.id}:${chapter.volume.volumeName}:${chapter.chapterName}';
+    var cached = await cache.readChapter(url);
+    if (cached != null && source is BiliNovelSource) {
+      final old = parse(cached);
+      final hasKeys = old.querySelectorAll('p').any((p) =>
+          p.attributes.keys.any((k) => RegExp(r'^data-k\d+$').hasMatch(k.toString())));
+      if (hasKeys && old.body?.attributes['data-bili-content-version'] != '2') {
+        if (offline) {
+          throw StateError('旧缓存可能含隐藏重复段落，请先使用 start.bat 在线更新该书。'
+              '旧缓存已保留。章节: ${chapter.chapterName}');
+        }
+        console.writeLine('更新旧版正文缓存: ${chapter.chapterName}');
+        cached = null; // Replace only after a successful, visibility-checked fetch.
+      }
+    }
+    late Document doc;
+    if (cached != null) {
+      console.writeLine('使用缓存: ${chapter.chapterName}');
+      doc = parse(cached);
+      if (!textOnly && !offline && doc.querySelector('img') != null &&
+          source is BiliNovelSource) {
+        await (source as BiliNovelSource).prepareImageContext(chapter);
+      }
+    } else {
+      if (offline) throw StateError('离线模式缺少章节: ${chapter.chapterName}');
+      doc = await source.getNovelChapter(chapter);
+      await cache.saveChapter(url, chapter.chapterName, doc.outerHtml);
+    }
     // 处理图片资源
     await _resolveImages(
       doc: doc,
@@ -214,14 +262,20 @@ class NovelPacker {
     required LightNovelCoverDetector? detector,
   }) async {
     List<Element> imgList = doc.querySelectorAll("img");
+    if (textOnly || offline) {
+      for (final image in imgList) { image.remove(); }
+      return;
+    }
     for (var img in imgList) {
       var imageData = await _downloadImage(img);
       if (imageData == null) {
+        img.replaceWith(Element.tag("p")..text = "[插图下载失败，重新运行可补全]");
         continue;
       }
-      String imageName = "${imageSeq.next.toString().padLeft(6, '0')}.jpg";
+      final format = _imageFormat(imageData);
+      String imageName = "${imageSeq.next.toString().padLeft(6, '0')}.${format.$1}";
       String relativeSrc = "images/$imageName";
-      packer.addImage(name: "OEBPS/$relativeSrc", data: imageData);
+      packer.addImage(name: "OEBPS/$relativeSrc", data: imageData, mediaType: format.$2);
       String src = img.attributes["src"]!;
       img.attributes["src"] = relativeSrc;
       try {
@@ -242,12 +296,17 @@ class NovelPacker {
   }
 
   Future<Uint8List?> _downloadImageByUrl(String url) async {
+    if (textOnly || offline) return null;
     try {
-      Uint8List imageData = await source.getImage(url);
+      final cached = await cache.readImage(url);
+      if (cached != null) return cached;
+      Uint8List imageData = await source.getImage(url).timeout(const Duration(seconds: 90));
       if (imageData.isEmpty) {
         console.writeLine("$url 图片下载失败: 图片下载为空");
         return null;
       }
+      _imageFormat(imageData); // Reject HTML/error responses masquerading as images.
+      await cache.saveImage(url, imageData);
       return imageData;
     } catch (e) {
       console.writeLine("$url 图片下载失败: $e");
@@ -263,11 +322,12 @@ class NovelPacker {
   }) async {
     // 优先使用volume.cover 但需检测比例
     if (volume.cover != null) {
-      String coverId = imageSeq.next.toString().padLeft(6, '0');
-      String coverName = "images/$coverId.jpg";
       Uint8List? coverData = await _downloadImageByUrl(volume.cover!);
       if (coverData != null && coverData.isNotEmpty) {
-        packer.addImage(name: "OEBPS/$coverName", data: coverData);
+        final format = _imageFormat(coverData);
+        String coverId = imageSeq.next.toString().padLeft(6, '0');
+        String coverName = "images/$coverId.${format.$1}";
+        packer.addImage(name: "OEBPS/$coverName", data: coverData, mediaType: format.$2);
         coverDetector.addFirst("OEBPS/$coverName", coverData);
       }
     }
@@ -275,6 +335,21 @@ class NovelPacker {
     if (cover != null) {
       packer.cover = cover.replaceFirst("OEBPS/", "");
     }
+  }
+
+  (String, String) _imageFormat(Uint8List data) {
+    if (data.length >= 8 && data[0] == 137 && data[1] == 80 &&
+        data[2] == 78 && data[3] == 71) return ('png', 'image/png');
+    if (data.length >= 3 && data[0] == 255 && data[1] == 216 &&
+        data[2] == 255) return ('jpg', 'image/jpeg');
+    if (data.length >= 6 && String.fromCharCodes(data.take(3)) == 'GIF') {
+      return ('gif', 'image/gif');
+    }
+    if (data.length >= 12 && String.fromCharCodes(data.take(4)) == 'RIFF' &&
+        String.fromCharCodes(data.skip(8).take(4)) == 'WEBP') {
+      return ('webp', 'image/webp');
+    }
+    throw StateError('图片格式不支持或返回了网页，已跳过。');
   }
 
   String _sanitizeFileName(String name) {

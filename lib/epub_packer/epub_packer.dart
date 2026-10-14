@@ -122,7 +122,7 @@ class EpubPacker {
     required String chapterContent,
   }) {
     // 相对于toc和opf文件的路径
-    String href = path.relative(name, from: "OEBPS");
+    String href = path.relative(name, from: "OEBPS").replaceAll('\\', '/');
     id ??= href;
     Uint8List utf8Uint8List = _utf8Encoder.convert(chapterContent);
     addArchiveFile(
@@ -149,7 +149,7 @@ class EpubPacker {
     required String name,
     required Uint8List data,
   }) {
-    String href = path.relative(name, from: "OEBPS");
+    String href = path.relative(name, from: "OEBPS").replaceAll('\\', '/');
     id ??= href;
     id = _normalized(id);
     addArchiveFile(
@@ -180,7 +180,7 @@ class EpubPacker {
   }
 
   /// 执行打包操作
-  void pack() {
+  void pack({bool partial = false}) {
     bookUuid = Uuid().v1();
 
     // mimetype 应为打包的第一个文件
@@ -222,10 +222,21 @@ class EpubPacker {
       ),
     );
     final ZipFileEncoder zip = ZipFileEncoder();
-    zip.create(epubFilePath, level: 0);
+    final destination = partial
+        ? epubFilePath.replaceFirst(RegExp(r'\.epub$'), '.partial.epub')
+        : epubFilePath;
+    File(destination).parent.createSync(recursive: true);
+    zip.create('$destination.tmp', level: 0);
     for (var archiveFile in archiveFiles) {
       zip.addArchiveFile(archiveFile);
     }
     zip.close();
+    final destinationFile = File(destination);
+    if (destinationFile.existsSync()) destinationFile.deleteSync();
+    File("$destination.tmp").renameSync(destination);
+    if (!partial) {
+      final previousPartial = File(epubFilePath.replaceFirst(RegExp(r'\.epub$'), '.partial.epub'));
+      if (previousPartial.existsSync()) previousPartial.deleteSync();
+    }
   }
 }

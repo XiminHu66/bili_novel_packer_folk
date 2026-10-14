@@ -1,69 +1,35 @@
 import 'package:dio/dio.dart';
 
-const _retryInfoKey = "retry_info";
-
+const _retryInfoKey = "retry_count";
 class RetryInterceptor extends Interceptor {
   final Dio dio;
   final int maxRetries;
   final Duration delay;
-
-  RetryInterceptor({
-    required this.dio,
-    this.maxRetries = 3,
-    this.delay = Duration.zero,
-  });
+  RetryInterceptor({required this.dio, this.maxRetries = 3,
+      this.delay = Duration.zero});
 
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) async {
-    if (!_shouldRetry(err)) {
-      super.onError(err, handler);
+    final count = (err.requestOptions.extra[_retryInfoKey] as int?) ?? 0;
+    final status = err.response?.statusCode;
+    final transient = [DioExceptionType.connectionError,
+      DioExceptionType.connectionTimeout, DioExceptionType.receiveTimeout,
+      DioExceptionType.sendTimeout].contains(err.type) ||
+      (status != null && status >= 500 && status <= 599);
+    // Login errors, verification, rate limits and cancellation require user action.
+    if (!transient || err.type == DioExceptionType.cancel || count >= maxRetries) {
+      handler.next(err);
       return;
     }
-    await _delay(err);
-    await _retry(err, handler);
-  }
-
-  bool _shouldRetry(DioException err) {
-    if (err.isCanceled()) {
-      return false;
+    err.requestOptions.extra[_retryInfoKey] = count + 1;
+    await Future<void>.delayed(delay * (1 << count));
+    try {
+      handler.resolve(await dio.fetch<dynamic>(err.requestOptions));
+    } on DioException catch (retryError) {
+      handler.reject(retryError);
+    } catch (error, stack) {
+      handler.reject(DioException(requestOptions: err.requestOptions,
+          error: error, stackTrace: stack));
     }
-    if (err.retried >= maxRetries) {
-      return false;
-    }
-    return true;
-  }
-
-  Future<void> _delay(DioException err) async {
-    if (delay.compareTo(Duration.zero) <= 0) {
-      return;
-    }
-    await Future.delayed(delay);
-  }
-
-  Future<void> _retry(DioException err, ErrorInterceptorHandler handler) async {
-    err.retried++;
-    var resp = await dio.fetch(err.requestOptions);
-    handler.resolve(resp);
-  }
-}
-
-class _RetryInfo {
-  int retried = 0;
-}
-
-extension _RetryInfoExt on DioException {
-  bool isCanceled() {
-    var opts = requestOptions;
-    return opts.cancelToken?.isCancelled ?? false;
-  }
-
-  int get retried => retryInfo().retried;
-
-  set retried(int retried) => retryInfo().retried = retried;
-
-  _RetryInfo retryInfo() {
-    var opts = requestOptions;
-    opts.extra[_retryInfoKey] ??= _RetryInfo();
-    return opts.extra[_retryInfoKey];
   }
 }
