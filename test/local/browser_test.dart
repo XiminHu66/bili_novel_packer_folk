@@ -215,6 +215,14 @@ void main() {
       expect(manualPauses, 1);
       expect(browser.headless, true);
       expect(await browser.evaluate('sessionStorage.getItem("readingPermission")'), 'granted');
+      await browser.evaluate('''(() => {
+        const promotion=document.createElement("div");
+        promotion.className="popup";
+        promotion.style="position:fixed;top:0;width:300px;height:100px";
+        promotion.textContent="观看广告，提高阅读体验";
+        document.body.appendChild(promotion);
+      })()''');
+      expect(await browser.hasReadingPermissionGate(), false);
       expect(await browser.readHtml(url), contains('Authorized chapter'));
       expect(manualPauses, 1);
     } finally {

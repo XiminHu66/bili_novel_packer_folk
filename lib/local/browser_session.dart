@@ -358,7 +358,7 @@ class BrowserSession {
     final compact = text.replaceAll(RegExp(r'\s+'), '');
     return RegExp(r'(观看|觀看|播放|看).{0,12}(广告|廣告)', caseSensitive: false)
         .hasMatch(compact) &&
-        RegExp(r'阅读|閱讀|浏览|瀏覽|权限|權限|解锁|解鎖|继续|繼續|获得|獲得')
+        RegExp(r'阅读权限|閱讀權限|浏览权限|瀏覽權限|权限|權限|解锁|解鎖|继续|繼續|获得|獲得')
             .hasMatch(compact);
   }
 
@@ -368,7 +368,7 @@ class BrowserSession {
       const gateWords = text => {
         const t = text.replace(/\s+/g, '');
         return /(观看|觀看|播放|看).{0,12}(广告|廣告)/i.test(t) &&
-          /阅读|閱讀|浏览|瀏覽|权限|權限|解锁|解鎖|继续|繼續|获得|獲得/.test(t);
+          /阅读权限|閱讀權限|浏览权限|瀏覽權限|权限|權限|解锁|解鎖|继续|繼續|获得|獲得/.test(t);
       };
       const visible = element => {
         const style = getComputedStyle(element);
