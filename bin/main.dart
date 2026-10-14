@@ -12,7 +12,7 @@ import 'package:bili_novel_packer/novel_packer.dart';
 import 'package:bili_novel_packer/pack_option.dart';
 
 const String gitUrl = "https://github.com/XiminHu66/bili_novel_packer_folk";
-const String version = "0.2.50-local1";
+const String version = "0.2.50-local2";
 final browser = BrowserSession();
 bool textOnly = false;
 bool offline = false;
@@ -25,12 +25,13 @@ List<LightNovelSource> sources = [
 
 Future<void> main(List<String> args) async {
   if (args.contains('--help')) {
-    print('Bili Novel Packer 0.2.50-local1\n'
+    print('Bili Novel Packer 0.2.50-local2\n'
         '双击运行，或: bili_novel_packer.exe [选项] [小说/章节URL]\n'
         '--text-only  只下载文字，插图不阻塞打包\n'
         '--offline    从缓存打包已有章节（不启动 Chrome）\n'
         '--all        下载所有分卷并合并\n'
         '--check URL  仅检查该章节的正文与分页\n'
+        '--check-images URL  检查该章节正文和前三张插图\n'
         '--help       显示说明\n'
         '输出在当前目录；登录状态在本机专用 Chrome 目录。');
     return;
@@ -42,7 +43,7 @@ Future<void> main(List<String> args) async {
   final urls = args.where((a) => a.startsWith('https://') || a.startsWith('http://')).toList();
   printWelcome();
   try {
-    if (args.contains('--check')) {
+    if (args.contains('--check') || args.contains('--check-images')) {
       if (urls.length != 1 || offline) {
         throw ArgumentError('--check 需要一个章节链接，不能与 --offline 合用。');
       }
@@ -54,6 +55,16 @@ Future<void> main(List<String> args) async {
       final count = doc.body?.text.trim().length ?? 0;
       if (count == 0) throw StateError('章节正文为空。');
       print('章节检查通过：正文 $count 字符，插图 ${doc.querySelectorAll("img").length} 张。');
+      if (args.contains('--check-images')) {
+        final images = doc.querySelectorAll('img').take(3).toList();
+        for (var i = 0; i < images.length; i++) {
+          final url = images[i].attributes['src'];
+          if (url == null) continue;
+          final bytes = await source.getImage(url).timeout(const Duration(seconds: 60));
+          if (bytes.isEmpty) throw StateError('插图为空。');
+          print('插图 ${i + 1}/${images.length} 检查通过：${bytes.length} 字节。');
+        }
+      }
       return;
     }
     if (urls.isNotEmpty) {

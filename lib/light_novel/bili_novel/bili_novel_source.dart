@@ -427,7 +427,7 @@ class BiliNovelSource implements LightNovelSource {
             '确认可阅读该章后重新运行；已完成章节会从缓存恢复。');
       }
       throw StateError('网页没有正文，可能是验证、限流或网站结构变化。'
-          '请查看下载器 Chrome 中的当前页面，完成验证后重新运行。URL: $url');
+          '请重新运行下载器，在验证窗口中确认网页可阅读，再继续后台下载。URL: $url');
     }
     return content;
   }

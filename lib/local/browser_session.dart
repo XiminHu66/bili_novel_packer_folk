@@ -8,7 +8,8 @@ import 'package:path/path.dart' as p;
 class BrowserSession {
   final Directory profile;
   final String? executable;
-  final bool headless;
+  bool headless;
+  bool _mobile = true;
   final Duration requestGap;
   WebSocket? _socket;
   Process? _process;
@@ -17,7 +18,8 @@ class BrowserSession {
   final StreamController<Map<String, dynamic>> _events =
       StreamController.broadcast();
   DateTime? _lastRequest;
-  String? _frameId;
+  final Map<String, _ImageCapture> _imageByUrl = {};
+  final Map<String, _ImageCapture> _imageByRequest = {};
   bool get connected => _socket != null;
 
   BrowserSession({
@@ -57,6 +59,7 @@ class BrowserSession {
 
   Future<void> start({bool mobile = true}) async {
     if (connected) return;
+    _mobile = mobile;
     await profile.create(recursive: true);
     final activePort = File(p.join(profile.path, 'DevToolsActivePort'));
     if (await activePort.exists()) {
@@ -112,6 +115,7 @@ class BrowserSession {
             completer.complete(Map<String, dynamic>.from(message['result'] ?? {}));
           }
         } else {
+          _captureImageEvent(message);
           _events.add(message);
         }
       }, onDone: () {
@@ -121,7 +125,10 @@ class BrowserSession {
         _failPending(StateError('Chrome 连接断开，缓存已保留。'));
       });
       await command('Page.enable');
-      await command('Network.enable');
+      await command('Network.enable', {
+        'maxTotalBufferSize': 64 * 1024 * 1024,
+        'maxResourceBufferSize': 30 * 1024 * 1024,
+      });
       if (mobile) {
         final version = await command('Browser.getVersion');
         final ua = (version['userAgent'] as String)
@@ -198,7 +205,6 @@ class BrowserSession {
       if (result['errorText'] != null) {
         throw StateError('页面连接失败: ${result['errorText']}');
       }
-      _frameId = result['frameId'] as String?;
       await loaded.future.timeout(const Duration(seconds: 45));
       if (mainStatus == 429) throw StateError('网站限流（HTTP 429）。请等待后再运行，缓存已保留。');
       if (mainStatus != null && mainStatus! >= 500) {
@@ -219,35 +225,128 @@ class BrowserSession {
     stdout.writeln('普通 Chrome 中 linovelib.com 的登录不会自动转到 bilinovel.com。');
     stdout.writeln('确认窗口内能正常阅读后，回到这里按 Enter 继续。');
     stdin.readLineSync();
+    stdout.writeln('验证完成，正在关闭可见窗口并切换后台 headless 下载...');
+    await restartHeadless(url);
+  }
+
+  Future<void> restartHeadless(String url) async {
+    final urls = <String>{url, ..._imageByUrl.keys.take(32)};
+    // Preserve session-only cookies in memory when closing the verification window.
+    final response = await command('Network.getCookies', {'urls': urls.toList()});
+    final cookies = (response['cookies'] as List<dynamic>? ?? []).map((cookie) {
+      final source = Map<String, dynamic>.from(cookie as Map);
+      return <String, dynamic>{
+        for (final key in ['name', 'value', 'domain', 'path', 'secure',
+          'httpOnly', 'sameSite', 'expires', 'priority', 'sourceScheme',
+          'sourcePort', 'partitionKey'])
+          if (source.containsKey(key)) key: source[key],
+      };
+    }).toList();
+    final mobile = _mobile;
+    await close();
+    headless = true;
+    await start(mobile: mobile);
+    if (cookies.isNotEmpty) await command('Network.setCookies', {'cookies': cookies});
+    // Confirm the new browser can render the target before starting the job.
+    await readHtml(url);
+    stdout.writeln('已切换后台下载，不会再显示 Chrome 窗口。');
+  }
+
+  void _captureImageEvent(Map<String, dynamic> event) {
+    final params = event['params'] as Map<String, dynamic>?;
+    if (params == null) return;
+    final id = params['requestId'] as String?;
+    if (id == null) return;
+    if (event['method'] == 'Network.requestWillBeSent' && params['type'] == 'Image') {
+      final url = params['request']['url'] as String;
+      final capture = _imageByRequest.putIfAbsent(id, () => _ImageCapture(id));
+      _imageByUrl[url] = capture;
+    } else if (event['method'] == 'Network.responseReceived' && params['type'] == 'Image') {
+      final response = params['response'] as Map<String, dynamic>;
+      final capture = _imageByRequest.putIfAbsent(id, () => _ImageCapture(id));
+      capture.status = (response['status'] as num).toInt();
+      _imageByUrl[response['url'] as String] = capture;
+    } else if (event['method'] == 'Network.loadingFinished') {
+      final capture = _imageByRequest.remove(id);
+      if (capture != null) unawaited(_captureImageBody(capture));
+    } else if (event['method'] == 'Network.loadingFailed') {
+      final capture = _imageByRequest.remove(id);
+      if (capture != null && !capture.body.isCompleted) capture.body.complete(null);
+    }
+    // Keep a bounded window of rendered images across paginated chapter pages.
+    while (_imageByUrl.length > 32) {
+      _imageByUrl.remove(_imageByUrl.keys.first);
+    }
+  }
+
+  Future<void> _captureImageBody(_ImageCapture capture) async {
+    Uint8List? data;
+    try {
+      if (capture.status != null && capture.status! >= 200 && capture.status! < 300) {
+        final response = await command('Network.getResponseBody', {'requestId': capture.id});
+        final body = response['body'] as String? ?? '';
+        // Image bodies must be decoded as bytes; never UTF-8 encode binary response text.
+        if (response['base64Encoded'] == true) {
+          data = base64Decode(body);
+          if (data.isEmpty || data.length > 30 * 1024 * 1024) data = null;
+        }
+      }
+    } catch (_) { /* A navigated-away response may have been evicted from Chrome. */ }
+    if (!capture.body.isCompleted) capture.body.complete(data);
   }
 
   Future<Uint8List> readImage(String url) async {
+    final uri = Uri.parse(url);
+    if (!['http', 'https'].contains(uri.scheme)) {
+      throw ArgumentError('不支持的图片地址。');
+    }
+    final previouslyLoaded = _imageByUrl[url];
+    if (previouslyLoaded != null) {
+      final bytes = await previouslyLoaded.body.future
+          .timeout(const Duration(seconds: 10), onTimeout: () => null);
+      if (bytes != null) return bytes;
+    }
     await _pace();
-    final result = await command('Network.loadNetworkResource', {
-      'frameId': _frameId,
-      'url': url,
-      'options': {'disableCache': false, 'includeCredentials': true},
-    });
-    final resource = result['resource'] as Map<String, dynamic>;
-    final stream = resource['stream'] as String?;
-    if (resource['success'] != true || stream == null) {
-      throw StateError('图片请求失败，HTTP ${resource['httpStatusCode']}');
-    }
-    final bytes = BytesBuilder(copy: false);
+    // Load a real <img> inside the current chapter. Chrome supplies that page's
+    // Referer, cookies and normal image-request headers, without CORS fetch access.
+    _imageByUrl.remove(url);
+    await command('Network.setCacheDisabled', {'cacheDisabled': true});
     try {
-      while (true) {
-        final chunk = await command('IO.read', {'handle': stream, 'size': 65536});
-        final data = chunk['data'] as String? ?? '';
-        bytes.add(chunk['base64Encoded'] == true ? base64Decode(data) : utf8.encode(data));
-        if (bytes.length > 30 * 1024 * 1024) {
-          throw StateError('单张图片超过 30 MB，已跳过。');
-        }
-        if (chunk['eof'] == true) break;
+      final loaded = await evaluate('''
+        new Promise(resolve => {
+          const image = new Image();
+          image.referrerPolicy = 'unsafe-url';
+          image.style.display = 'none';
+          let done = false;
+          const finish = value => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            image.remove();
+            resolve(value);
+          };
+          const timer = setTimeout(() => {
+            image.src = '';
+            finish(false);
+          }, 30000);
+          image.onload = () => finish(true);
+          image.onerror = () => finish(false);
+          document.body.appendChild(image);
+          image.src = ${jsonEncode(url)};
+        })
+      ''');
+      final capture = _imageByUrl[url];
+      if (loaded != true || capture == null) {
+        throw StateError('图片在章节页面内加载失败，HTTP ${capture?.status ?? "未知"}。'
+            '请重新运行并在验证窗口确认插图可见；如果网站也无法显示，请等待恢复。');
       }
+      final bytes = await capture.body.future
+          .timeout(const Duration(seconds: 10), onTimeout: () => null);
+      if (bytes == null) throw StateError('图片响应不可读取或超过 30 MB。');
+      return bytes;
     } finally {
-      await command('IO.close', {'handle': stream});
+      await command('Network.setCacheDisabled', {'cacheDisabled': false});
     }
-    return bytes.takeBytes();
   }
 
   Future<void> close() async {
@@ -264,8 +363,21 @@ class BrowserSession {
       catch (_) { process.kill(); }
     }
     _process = null;
+    for (final capture in _imageByRequest.values) {
+      if (!capture.body.isCompleted) capture.body.complete(null);
+    }
+    _imageByRequest.clear();
+    _imageByUrl.clear();
+    _lastRequest = null;
     _failPending(StateError('下载器已退出。'));
     final activePort = File(p.join(profile.path, 'DevToolsActivePort'));
     if (await activePort.exists()) await activePort.delete();
   }
+}
+
+class _ImageCapture {
+  final String id;
+  int? status;
+  final Completer<Uint8List?> body = Completer<Uint8List?>();
+  _ImageCapture(this.id);
 }
