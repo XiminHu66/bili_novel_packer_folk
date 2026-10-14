@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:test/test.dart';
@@ -97,4 +98,78 @@ void main() {
       await profile.delete(recursive:true);
     }
   }, timeout: const Timeout(Duration(minutes:2)));
+  test('hung images cannot block text or prevent the real load handler', () async {
+    final profile = await Directory.systemTemp.createTemp('bili-slow-page');
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final browser = BrowserSession(profile: profile, headless: true,
+      requestGap: Duration.zero, resourceGrace: const Duration(milliseconds: 300));
+    server.listen((request) async {
+      if (request.uri.path == '/hung.png') {
+        // No response: this keeps window.load pending indefinitely in the old version.
+        return;
+      }
+      request.response.headers.contentType = ContentType.html;
+      request.response.write('<html><body><div id="acontent"><p>Before script</p>'
+        '<img src="/hung.png"></div><script>window.loadCount=0;'
+        'window.addEventListener("load",()=>{window.loadCount++;'
+        'document.querySelector("p").textContent="After script";});</script></body></html>');
+      await request.response.close();
+    });
+    try {
+      await browser.start(mobile: false);
+      final url = 'http://127.0.0.1:${server.port}/novel/1/2.html';
+      final timer = Stopwatch()..start();
+      final html = await browser.readHtml(url);
+      expect(html, contains('After script'));
+      expect(html, contains('data-src="/hung.png"'));
+      expect(await browser.evaluate('window.loadCount'), 1);
+      expect(timer.elapsed, lessThan(const Duration(seconds: 15)));
+      // Protocol timeout diagnostics name the exact operation and target page.
+      await expectLater(browser.command('Runtime.evaluate', {
+        'expression': 'new Promise(() => {})', 'awaitPromise': true,
+      }, const Duration(milliseconds: 100)), throwsA(isA<TimeoutException>()
+        .having((e) => e.message, 'stage', contains('Runtime.evaluate'))
+        .having((e) => e.message, 'url', contains(url))));
+    } finally {
+      await browser.close();
+      await server.close(force: true);
+      await profile.delete(recursive: true);
+    }
+  }, timeout: const Timeout(Duration(minutes: 3)));
+
+  test('temporary 503 is retried once; 403 is not retried', () async {
+    final profile = await Directory.systemTemp.createTemp('bili-page-retry');
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final browser = BrowserSession(profile: profile, headless: true,
+      requestGap: Duration.zero);
+    var transientCalls = 0;
+    var authCalls = 0;
+    server.listen((request) async {
+      request.response.headers.contentType = ContentType.html;
+      if (request.uri.path == '/denied') {
+        authCalls++;
+        request.response.statusCode = 403;
+        request.response.write('<html><body>Denied</body></html>');
+      } else {
+        transientCalls++;
+        request.response.statusCode = transientCalls == 1 ? 503 : 200;
+        request.response.write('<html><body><div id="acontent"><p>Recovered</p></div></body></html>');
+      }
+      await request.response.close();
+    });
+    try {
+      await browser.start(mobile: false);
+      final base = 'http://127.0.0.1:${server.port}';
+      expect(await browser.readHtml('$base/transient'), contains('Recovered'));
+      expect(transientCalls, 2);
+      await expectLater(browser.readHtml('$base/denied'),
+        throwsA(isA<StateError>().having((e) => e.message, 'status', contains('403'))));
+      expect(authCalls, 1);
+    } finally {
+      await browser.close();
+      await server.close(force: true);
+      await profile.delete(recursive: true);
+    }
+  }, timeout: const Timeout(Duration(minutes: 3)));
+
 }

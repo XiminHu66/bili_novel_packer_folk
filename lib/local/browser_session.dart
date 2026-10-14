@@ -11,6 +11,9 @@ class BrowserSession {
   bool headless;
   bool _mobile = true;
   final Duration requestGap;
+  final Duration pageTimeout;
+  final Duration resourceGrace;
+  String? _activeUrl;
   WebSocket? _socket;
   Process? _process;
   int _nextId = 0;
@@ -27,6 +30,8 @@ class BrowserSession {
     this.executable,
     this.headless = false,
     this.requestGap = const Duration(seconds: 4),
+    this.pageTimeout = const Duration(seconds: 35),
+    this.resourceGrace = const Duration(seconds: 6),
   }) : profile = profile ?? Directory(p.join(
       Platform.environment['LOCALAPPDATA'] ??
           Platform.environment['HOME'] ?? Directory.current.path,
@@ -132,6 +137,7 @@ class BrowserSession {
         _failPending(StateError('Chrome 连接断开，缓存已保留。'));
       });
       await command('Page.enable');
+      await command('Page.setLifecycleEventsEnabled', {'enabled': true});
       await command('Network.enable', {
         'maxTotalBufferSize': 64 * 1024 * 1024,
         'maxResourceBufferSize': 30 * 1024 * 1024,
@@ -162,7 +168,8 @@ class BrowserSession {
   }
 
   Future<Map<String, dynamic>> command(String method,
-      [Map<String, dynamic> params = const {}]) async {
+      [Map<String, dynamic> params = const {},
+      Duration timeout = const Duration(seconds: 45)]) async {
     final socket = _socket;
     if (socket == null) throw StateError('Chrome 未连接。');
     final id = ++_nextId;
@@ -170,18 +177,23 @@ class BrowserSession {
     _pending[id] = completer;
     socket.add(jsonEncode({'id': id, 'method': method, 'params': params}));
     try {
-      return await completer.future.timeout(const Duration(seconds: 45));
+      return await completer.future.timeout(timeout, onTimeout: () {
+        throw TimeoutException('浏览器操作超时: $method (${timeout.inSeconds} 秒)'
+            '${_activeUrl == null ? "" : "\n页面: $_activeUrl"}');
+      });
     } finally {
       _pending.remove(id);
     }
   }
 
-  Future<dynamic> evaluate(String expression) async {
+  Future<dynamic> evaluate(String expression,
+      [Duration timeout = const Duration(seconds: 45)]) async {
     final response = await command('Runtime.evaluate', {
       'expression': expression, 'returnByValue': true, 'awaitPromise': true,
-    });
+      'timeout': timeout.inMilliseconds,
+    }, timeout);
     if (response['exceptionDetails'] != null) {
-      throw StateError('页面脚本执行失败。');
+      throw StateError('浏览器 Runtime.evaluate 脚本执行失败。页面: $_activeUrl');
     }
     return response['result']?['value'];
   }
@@ -195,39 +207,118 @@ class BrowserSession {
     _lastRequest = DateTime.now();
   }
 
-  Future<String> readHtml(String url) async {
-    await _pace();
-    final loaded = Completer<void>();
-    int? mainStatus;
-    final subscription = _events.stream.listen((e) {
-      if (e['method'] == 'Network.responseReceived' && e['params']?['type'] == 'Document') {
-        mainStatus = (e['params']['response']['status'] as num).toInt();
+  Future<String> readHtml(String url, {bool verification = false}) async {
+    _activeUrl = url;
+    final attempts = verification ? 1 : 2;
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      try {
+        return await _readHtmlOnce(url, verification: verification);
+      } on TimeoutException catch (error) {
+        try { await command('Page.stopLoading', {}, const Duration(seconds: 5)); }
+        catch (_) {}
+        try { await command('Runtime.terminateExecution', {}, const Duration(seconds: 3)); }
+        catch (_) {}
+        if (attempt + 1 >= attempts) {
+          throw TimeoutException('页面自动重试后仍失败。\n$error');
+        }
+        stdout.writeln('页面暂时超时，自动重试 1 次: $url\n$error');
+        await Future<void>.delayed(const Duration(seconds: 3));
+      } on _PageNetworkFailure catch (error) {
+        if (attempt + 1 >= attempts) rethrow;
+        stdout.writeln('页面连接暂时失败，自动重试 1 次: $url\n$error');
+        await Future<void>.delayed(const Duration(seconds: 3));
       }
-      if (e['method'] == 'Page.loadEventFired' && !loaded.isCompleted) {
-        loaded.complete();
+    }
+    throw StateError('无法读取页面: $url');
+  }
+
+  Future<String> _readHtmlOnce(String url, {required bool verification}) async {
+    await _pace();
+    final stages = <String, Set<String>>{};
+    final statuses = <String, int>{};
+    final subscription = _events.stream.listen((e) {
+      final params = e['params'] as Map<String, dynamic>?;
+      if (params == null) return;
+      final loader = params['loaderId'] as String?;
+      if (loader == null) return;
+      if (e['method'] == 'Page.lifecycleEvent') {
+        stages.putIfAbsent(loader, () => {}).add(params['name'] as String);
+      }
+      if (e['method'] == 'Network.responseReceived' && params['type'] == 'Document') {
+        statuses[loader] = (params['response']['status'] as num).toInt();
       }
     });
     try {
-      final result = await command('Page.navigate', {'url': url});
+      final result = await command('Page.navigate', {'url': url}, pageTimeout);
       if (result['errorText'] != null) {
-        throw StateError('页面连接失败: ${result['errorText']}');
+        throw _PageNetworkFailure('页面连接失败: ${result['errorText']}。URL: $url');
       }
-      await loaded.future.timeout(const Duration(seconds: 45));
-      if (mainStatus == 429) throw StateError('网站限流（HTTP 429）。请等待后再运行，缓存已保留。');
-      if (mainStatus != null && mainStatus! >= 500) {
-        throw StateError('网站服务器错误（HTTP $mainStatus），请稍后重试。');
+      final loader = result['loaderId'] as String?;
+      final deadline = DateTime.now().add(pageTimeout);
+      while (loader != null &&
+          !(stages[loader]?.contains('DOMContentLoaded') ?? false)) {
+        final status = statuses[loader];
+        _requirePageStatus(status, url);
+        if (DateTime.now().isAfter(deadline)) {
+          throw TimeoutException('等待正文 DOM 就绪超时。URL: $url，HTTP: ${status ?? "未收到"}');
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 150));
       }
+      _requirePageStatus(loader == null ? null : statuses[loader], url);
+      if (!verification) {
+        final grace = DateTime.now().add(resourceGrace);
+        while (!(stages[loader]?.contains('load') ?? false)) {
+          if (await evaluate('document.readyState', const Duration(seconds: 5)) == 'complete') break;
+          if (DateTime.now().isAfter(grace)) {
+            // Preserve illustration URLs, then release load handlers from hung resources.
+            // Never synthesize a load event: that could shuffle the chapter twice.
+            await evaluate('''(() => {
+              for (const image of document.images) {
+                if (!image.complete) {
+                  if (!image.hasAttribute('data-src') && image.getAttribute('src')) {
+                    image.setAttribute('data-src', image.getAttribute('src'));
+                  }
+                  image.removeAttribute('srcset');
+                  image.removeAttribute('src');
+                }
+              }
+            })()''', const Duration(seconds: 5));
+            await command('Page.stopLoading', {}, const Duration(seconds: 5));
+            final stoppedDeadline = DateTime.now().add(const Duration(seconds: 5));
+            while (await evaluate('document.readyState', const Duration(seconds: 5)) != 'complete') {
+              if (DateTime.now().isAfter(stoppedDeadline)) {
+                throw TimeoutException('正文已到达，但页面脚本收尾未完成。URL: $url');
+              }
+              await Future<void>.delayed(const Duration(milliseconds: 150));
+            }
+            break;
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 150));
+        }
+      }
+      // Site post-load paragraph/font scripts get time to complete; images download separately.
       await Future<void>.delayed(const Duration(seconds: 2));
-      return await evaluate('document.documentElement.outerHTML') as String;
+      return await evaluate('document.documentElement.outerHTML',
+          const Duration(seconds: 10)) as String;
     } finally {
       await subscription.cancel();
+    }
+  }
+
+  void _requirePageStatus(int? status, String url) {
+    if (status == 429) throw StateError('网站限流（HTTP 429），请等待后继续。URL: $url');
+    if (status == 401 || status == 403) {
+      throw StateError('网站拒绝当前会话（HTTP $status），请重新运行并在验证窗口确认可阅读。URL: $url');
+    }
+    if (status != null && status >= 500) {
+      throw _PageNetworkFailure('网站服务器错误（HTTP $status）。URL: $url');
     }
   }
 
   Future<void> prepareLogin(String url) async {
     stdout.writeln('正在打开 Chrome 验证窗口，请稍候...');
     await start();
-    await readHtml(url);
+    await readHtml(url, verification: true);
     stdout.writeln('\n已打开下载器专用 Chrome（登录状态保存在本机）。');
     stdout.writeln('请在这个窗口登录哔哩轻小说，并完成网页要求的验证。');
     stdout.writeln('普通 Chrome 中 linovelib.com 的登录不会自动转到 bilinovel.com。');
@@ -388,4 +479,11 @@ class _ImageCapture {
   int? status;
   final Completer<Uint8List?> body = Completer<Uint8List?>();
   _ImageCapture(this.id);
+}
+
+class _PageNetworkFailure implements Exception {
+  final String message;
+  _PageNetworkFailure(this.message);
+  @override
+  String toString() => message;
 }

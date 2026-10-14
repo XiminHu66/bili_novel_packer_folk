@@ -200,6 +200,8 @@ class NovelPacker {
     required Sequence imageSeq,
     LightNovelCoverDetector? detector,
   }) async {
+    console.writeLine('正在读取章节: ${chapter.chapterName}');
+    logger.i('Chapter: ${chapter.chapterName}, URL: ${chapter.chapterUrl}');
     final url = chapter.chapterUrl ??
         'chapter:${chapter.volume.catalog.novel.id}:${chapter.volume.volumeName}:${chapter.chapterName}';
     final cached = await cache.readChapter(url);

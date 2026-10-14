@@ -1,4 +1,4 @@
-# 本地下载版 0.2.50-local2
+# 本地下载版 0.2.50-local3
 
 需要 Windows 10/11 x64 和已安装的 Google Chrome，不需要 Dart/Python。
 这是基于 Montaro2017/bili_novel_packer 的 MIT 许可修改版。
@@ -44,6 +44,13 @@ partial 表示尚未完成整本，成功完成会删除对应 partial 文件。
 
 Chrome 装在自定义位置时，在终端设置 BILI_CHROME 为完整 chrome.exe 路径。
 源代码运行需要 Dart >=3.11：dart pub get，然后 dart run bin/main.dart。
+
+## local3 超时修复
+- 等待当前章节 DOM；长时间阻塞的图片停止载入后保留原始图片 URL，再让网站自己的 load 回调正常完成。不会手动触发 load，避免段落重复还原。
+- 浏览器操作超时会报告 Page.navigate、Runtime.evaluate 等具体步骤及章节 URL。
+- 临时连接故障/超时/503 最多自动重试一次；401/403/429 不反复重试。
+- 每个章节显示名称并记入 bili_novel.log，便于定位失败位置。
+- 保留原缓存及验证后 headless 模式。
 
 ## local2 更新
 - 修复截图中的 CDN HTTP 403：从章节内正常的 img 请求获取图片，携带真实 Referer，避免使用缺少来源信息的调试资源请求。
