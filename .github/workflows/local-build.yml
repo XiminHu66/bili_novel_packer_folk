@@ -29,6 +29,8 @@ jobs:
         with:
           sdk: '3.13.5'
       - run: dart pub get
+      - name: Windows Chrome session verification
+        run: dart test test/local/browser_test.dart --reporter expanded
       - name: Compile standalone executable
         run: |
           New-Item -ItemType Directory -Force dist

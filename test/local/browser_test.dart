@@ -6,7 +6,7 @@ import 'package:bili_novel_packer/light_novel/bili_novel/bili_novel_source.dart'
 import 'package:bili_novel_packer/light_novel/base/light_novel_model.dart';
 
 void main() {
-  test('real Chrome executes chapter scripts once and loads authenticated images', () async {
+  test('real Chrome preserves CDN Referer, cached images and cookies through headless restart', () async {
     final profile = await Directory.systemTemp.createTemp('bili-browser-test');
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final cdn = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
