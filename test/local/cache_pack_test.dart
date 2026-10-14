@@ -62,7 +62,7 @@ void main() {
         Chapter('Second', 'https://example.test/2', volume),
       ]);
       final source = FakeSource()..fail=true;
-      final option = PackOption();
+      final option = PackOption()..addChapterTitle=false..selectedVolumes=[volume];
       await expectLater(NovelPacker(source, textOnly:true).packVolume(
         source:source, volume:volume, option:option), throwsStateError);
       final partial = File('Fixture/Fixture.partial.epub');

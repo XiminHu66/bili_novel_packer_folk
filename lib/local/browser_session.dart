@@ -184,7 +184,11 @@ class BrowserSession {
   Future<String> readHtml(String url) async {
     await _pace();
     final loaded = Completer<void>();
+    int? mainStatus;
     final subscription = _events.stream.listen((e) {
+      if (e['method'] == 'Network.responseReceived' && e['params']?['type'] == 'Document') {
+        mainStatus = (e['params']['response']['status'] as num).toInt();
+      }
       if (e['method'] == 'Page.loadEventFired' && !loaded.isCompleted) {
         loaded.complete();
       }
@@ -196,6 +200,10 @@ class BrowserSession {
       }
       _frameId = result['frameId'] as String?;
       await loaded.future.timeout(const Duration(seconds: 45));
+      if (mainStatus == 429) throw StateError('网站限流（HTTP 429）。请等待后再运行，缓存已保留。');
+      if (mainStatus != null && mainStatus! >= 500) {
+        throw StateError('网站服务器错误（HTTP $mainStatus），请稍后重试。');
+      }
       await Future<void>.delayed(const Duration(seconds: 2));
       return await evaluate('document.documentElement.outerHTML') as String;
     } finally {

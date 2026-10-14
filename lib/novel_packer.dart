@@ -124,9 +124,10 @@ class NovelPacker {
         ? null
         : await _downloadImageByUrl(novel.coverUrl!);
     if (coverData != null && coverData.isNotEmpty) {
+      final format = _imageFormat(coverData);
       String coverId = imageSeq.next.toString().padLeft(6, '0');
-      String coverName = "images/$coverId.jpg";
-      packer.addImage(name: "OEBPS/$coverName", data: coverData);
+      String coverName = "images/$coverId.${format.$1}";
+      packer.addImage(name: "OEBPS/$coverName", data: coverData, mediaType: format.$2);
       packer.cover = coverName;
     }
 
@@ -251,9 +252,10 @@ class NovelPacker {
         img.replaceWith(Element.tag("p")..text = "[插图下载失败，重新运行可补全]");
         continue;
       }
-      String imageName = "${imageSeq.next.toString().padLeft(6, '0')}.jpg";
+      final format = _imageFormat(imageData);
+      String imageName = "${imageSeq.next.toString().padLeft(6, '0')}.${format.$1}";
       String relativeSrc = "images/$imageName";
-      packer.addImage(name: "OEBPS/$relativeSrc", data: imageData);
+      packer.addImage(name: "OEBPS/$relativeSrc", data: imageData, mediaType: format.$2);
       String src = img.attributes["src"]!;
       img.attributes["src"] = relativeSrc;
       try {
@@ -283,6 +285,7 @@ class NovelPacker {
         console.writeLine("$url 图片下载失败: 图片下载为空");
         return null;
       }
+      _imageFormat(imageData); // Reject HTML/error responses masquerading as images.
       await cache.saveImage(url, imageData);
       return imageData;
     } catch (e) {
@@ -299,11 +302,12 @@ class NovelPacker {
   }) async {
     // 优先使用volume.cover 但需检测比例
     if (volume.cover != null) {
-      String coverId = imageSeq.next.toString().padLeft(6, '0');
-      String coverName = "images/$coverId.jpg";
       Uint8List? coverData = await _downloadImageByUrl(volume.cover!);
       if (coverData != null && coverData.isNotEmpty) {
-        packer.addImage(name: "OEBPS/$coverName", data: coverData);
+        final format = _imageFormat(coverData);
+        String coverId = imageSeq.next.toString().padLeft(6, '0');
+        String coverName = "images/$coverId.${format.$1}";
+        packer.addImage(name: "OEBPS/$coverName", data: coverData, mediaType: format.$2);
         coverDetector.addFirst("OEBPS/$coverName", coverData);
       }
     }
@@ -311,6 +315,21 @@ class NovelPacker {
     if (cover != null) {
       packer.cover = cover.replaceFirst("OEBPS/", "");
     }
+  }
+
+  (String, String) _imageFormat(Uint8List data) {
+    if (data.length >= 8 && data[0] == 137 && data[1] == 80 &&
+        data[2] == 78 && data[3] == 71) return ('png', 'image/png');
+    if (data.length >= 3 && data[0] == 255 && data[1] == 216 &&
+        data[2] == 255) return ('jpg', 'image/jpeg');
+    if (data.length >= 6 && String.fromCharCodes(data.take(3)) == 'GIF') {
+      return ('gif', 'image/gif');
+    }
+    if (data.length >= 12 && String.fromCharCodes(data.take(4)) == 'RIFF' &&
+        String.fromCharCodes(data.skip(8).take(4)) == 'WEBP') {
+      return ('webp', 'image/webp');
+    }
+    throw StateError('图片格式不支持或返回了网页，已跳过。');
   }
 
   String _sanitizeFileName(String name) {
