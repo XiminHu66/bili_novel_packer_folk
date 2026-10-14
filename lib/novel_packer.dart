@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:bili_novel_packer/local/download_cache.dart';
+import 'package:bili_novel_packer/light_novel/bili_novel/bili_novel_source.dart';
 
 import 'package:bili_novel_packer/assets/assets.dart';
 import 'package:bili_novel_packer/console/console.dart';
@@ -206,6 +207,10 @@ class NovelPacker {
     if (cached != null) {
       console.writeLine('使用缓存: ${chapter.chapterName}');
       doc = parse(cached);
+      if (!textOnly && !offline && doc.querySelector('img') != null &&
+          source is BiliNovelSource) {
+        await (source as BiliNovelSource).prepareImageContext(chapter);
+      }
     } else {
       if (offline) throw StateError('离线模式缺少章节: ${chapter.chapterName}');
       doc = await source.getNovelChapter(chapter);

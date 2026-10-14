@@ -80,6 +80,11 @@ void main() {
       await browser.readHtml('http://127.0.0.1:${server.port}/next');
       // Bytes captured on the prior page remain available after navigation.
       expect(await browser.readImage(cdnUrl), orderedEquals(image));
+      // Resuming cached text must restore chapter Referer after a catalog navigation.
+      await browser.readHtml('http://127.0.0.1:${server.port}/catalog');
+      await source.prepareImageContext(Chapter('T', pageUrl, volume));
+      expect(await browser.evaluate('location.href'), pageUrl);
+      expect(await browser.readImage('$cdnUrl?resume'), orderedEquals(image));
       // Session cookies survive the visible-verification -> headless restart.
       await browser.restartHeadless(pageUrl);
       expect(browser.headless, true);

@@ -575,6 +575,13 @@ class BiliNovelSource implements LightNovelSource {
     return (await _dio.get<String>(url)).data ?? '';
   }
 
+  /// A cached text chapter must still restore its page before requesting CDN images.
+  Future<void> prepareImageContext(Chapter chapter) async {
+    if (browser != null && !offline) {
+      await browser!.readHtml(await _requireChapterUrl(chapter));
+    }
+  }
+
   /// Check a single chapter without requesting the full book.
   Future<Document> checkChapter(String url) async {
     final id = _getId(url);
