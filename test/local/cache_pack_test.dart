@@ -73,6 +73,13 @@ void main() {
       expect(source.calls, 3);
       verifyEpub(File('Fixture/Fixture.epub'), chapters:2);
       expect(partial.existsSync(), false);
+      // Image errors must not discard text; exporting cached text must avoid refetching chapters.
+      await NovelPacker(source).packCombine(source:source, novel:novel, option:option);
+      expect(source.calls, 3);
+      verifyEpub(File('Fixture/Fixture.epub'), chapters:2);
+      final failedImagesZip = ZipDecoder().decodeBytes(File('Fixture/Fixture.epub').readAsBytesSync());
+      expect(failedImagesZip.files.where((f) => f.name.startsWith('OEBPS/chapter'))
+          .every((entry) => !String.fromCharCodes(entry.content as List<int>).contains('<img')), true);
       source.fail=true;
       await NovelPacker(source, textOnly:true, offline:true).packVolume(
         source:source, volume:volume, option:option);
