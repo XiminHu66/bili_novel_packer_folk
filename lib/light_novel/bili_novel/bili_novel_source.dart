@@ -307,6 +307,7 @@ class BiliNovelSource implements LightNovelSource {
   }
 
   Document _finalizeChapterDocument(Document doc) {
+    doc.body!.attributes['data-bili-content-version'] = '2';
     HTMLUtil.unescape(doc.body!);
     HTMLUtil.removeLineBreak(doc.body!);
     _normalizeImg(doc.body!);
@@ -390,6 +391,12 @@ class BiliNovelSource implements LightNovelSource {
 
     String? title = _getChapterPageTitle(url, doc);
     Element content = _getChapterPageContent(url, html, doc);
+    final hasKeys = content.querySelectorAll('p').any((p) =>
+        p.attributes.keys.any((k) => RegExp(r'^data-k\d+$').hasMatch(k.toString())));
+    if (hasKeys && content.attributes['data-bili-rendered'] != 'visible-v1') {
+      throw StateError('正文包含网站生成的隐藏副本标记，需要 Chrome 的实际显示状态。'
+          '已停止保存，避免把重复内容写入 EPUB。URL: $url');
+    }
     _ChapterNavigation navigation = _getChapterNavigation(doc, url);
     _cleanChapterContent(content);
     // Chrome has already executed chapterlog.js; never shuffle the rendered DOM twice.

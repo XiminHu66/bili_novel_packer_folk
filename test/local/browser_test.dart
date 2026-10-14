@@ -7,6 +7,46 @@ import 'package:bili_novel_packer/light_novel/bili_novel/bili_novel_source.dart'
 import 'package:bili_novel_packer/light_novel/base/light_novel_model.dart';
 
 void main() {
+  test('CSS-hidden bait is excluded; visible repeated dialogue and off-screen text survive', () async {
+    final profile = await Directory.systemTemp.createTemp('bili-hidden-text');
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final browser = BrowserSession(profile: profile, headless: true, requestGap: Duration.zero);
+    server.listen((request) async {
+      request.response.headers.contentType = ContentType.html;
+      request.response.write('''<html><head><style>
+        p[data-k450]{display:none} p[data-k451]{transform:scale(0)}
+        p[data-k452]{opacity:0} p[data-k453]{visibility:hidden}
+        p[data-k5]{transform:translateY(20000px)}
+        </style></head><body><div id="acontent">
+        <p data-k450="">Original sentence</p><p data-k1="">Original sentence</p>
+        <p data-k2="">……</p><p data-k3="">……</p>
+        <p data-k451="">Original sentence</p><p data-k452="">Original sentence</p>
+        <p data-k4="">Visible repeated sentence</p><p data-k4="">Visible repeated sentence</p>
+        <p data-k453="">Original sentence</p><p data-k5="">Off-screen sentence</p>
+        <p><img data-src="/lazy.png"></p></div></body></html>''');
+      await request.response.close();
+    });
+    try {
+      await browser.start(mobile: false);
+      final novel = Novel()..id='1'..title='T'..author='A'..status='';
+      final volume = Volume('', Catalog(novel));
+      final source = BiliNovelSource(browser: browser);
+      final doc = await source.getNovelChapter(Chapter('T',
+        'http://127.0.0.1:${server.port}/novel/1/3.html', volume));
+      expect(doc.querySelectorAll('p').map((p) => p.text).where((t) => t.isNotEmpty).toList(),
+        ['Original sentence', '……', '……', 'Visible repeated sentence',
+         'Visible repeated sentence', 'Off-screen sentence']);
+      expect(doc.querySelectorAll('img'), hasLength(1));
+      expect(doc.body!.attributes['data-bili-content-version'], '2');
+      // The live DOM and site's own paragraph processing have not been changed.
+      expect(await browser.evaluate('document.querySelectorAll("#acontent p").length'), 11);
+    } finally {
+      await browser.close();
+      await server.close(force: true);
+      await profile.delete(recursive: true);
+    }
+  }, timeout: const Timeout(Duration(minutes: 3)));
+
   test('real Chrome preserves CDN Referer, cached images and cookies through headless restart', () async {
     final profile = await Directory.systemTemp.createTemp('bili-browser-test');
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);

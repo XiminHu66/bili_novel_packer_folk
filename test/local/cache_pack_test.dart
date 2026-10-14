@@ -4,6 +4,7 @@ import 'package:archive/archive.dart';
 import 'package:html/dom.dart';
 import 'package:test/test.dart';
 import 'package:bili_novel_packer/local/download_cache.dart';
+import 'package:bili_novel_packer/light_novel/bili_novel/bili_novel_source.dart';
 import 'package:bili_novel_packer/light_novel/base/light_novel_model.dart';
 import 'package:bili_novel_packer/light_novel/base/light_novel_source.dart';
 import 'package:bili_novel_packer/novel_packer.dart';
@@ -36,6 +37,46 @@ void verifyEpub(File file, {required int chapters}) {
   }
 }
 void main() {
+  test('legacy keyed cache is retained offline and replaced only by a successful verified fetch', () async {
+    final previous = Directory.current;
+    final directory = await Directory.systemTemp.createTemp('bili-legacy-cache');
+    Directory.current = directory;
+    try {
+      final novel = Novel()..id='1'..title='Migration'..author='A'..status='';
+      final volume = Volume('', Catalog(novel));
+      final chapter = Chapter('T', 'https://www.bilinovel.com/novel/1/1.html', volume);
+      volume.chapters.add(chapter);
+      final cache = DownloadCache();
+      const legacy = '<html><body><p data-k1="">Text</p><p data-k450="">Text</p></body></html>';
+      await cache.saveChapter(chapter.chapterUrl!, 'T', legacy);
+      var calls = 0;
+      var fail = true;
+      final source = BiliNovelSource(htmlLoader: (_) async {
+        calls++;
+        if (fail) throw StateError('fixture network failure');
+        return '<div id="acontent" data-bili-rendered="visible-v1"><p data-k1="">Text</p></div>';
+      });
+      final option = PackOption()..addChapterTitle=false..selectedVolumes=[volume];
+      Future<void> pack({bool offline = false}) => NovelPacker(source, cache: cache,
+          textOnly: true, offline: offline).packVolume(source: source, volume: volume, option: option);
+      await expectLater(pack(offline: true), throwsStateError);
+      expect(calls, 0);
+      await expectLater(pack(), throwsStateError);
+      expect(await cache.readChapter(chapter.chapterUrl!), legacy);
+      fail = false;
+      await pack();
+      expect(calls, 2);
+      final saved = await cache.readChapter(chapter.chapterUrl!);
+      expect(saved, contains('data-bili-content-version="2"'));
+      expect(saved, isNot(contains('data-k450')));
+      await pack(offline: true);
+      expect(calls, 2);
+      verifyEpub(File('Migration/Migration.epub'), chapters: 1);
+    } finally {
+      Directory.current = previous;
+      await directory.delete(recursive: true);
+    }
+  });
   test('cache survives a new instance and corrupt records are misses', () async {
     final directory = await Directory.systemTemp.createTemp('bili-cache-test');
     try {

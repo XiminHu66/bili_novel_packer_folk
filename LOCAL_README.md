@@ -1,4 +1,4 @@
-# 本地下载版 0.2.50-local4
+# 本地下载版 0.2.50-local5
 
 需要 Windows 10/11 x64 和已安装的 Google Chrome，不需要 Dart/Python。
 这是基于 Montaro2017/bili_novel_packer 的 MIT 许可修改版。
@@ -46,6 +46,13 @@ partial 表示尚未完成整本，成功完成会删除对应 partial 文件。
 
 Chrome 装在自定义位置时，在终端设置 BILI_CHROME 为完整 chrome.exe 路径。
 源代码运行需要 Dart >=3.11：dart pub get，然后 dart run bin/main.dart。
+
+## local5 重复正文修复
+- 导出前使用 Chrome 的实际 CSS 显示状态，只移除不可见的文字段落；保留可见的重复对白、省略号、屏幕外正文和懒加载插图。
+- 检查正文样式已载入。网站带段落标记但未经浏览器显示检查时停止保存，避免写入错误章节。
+- 在线下载自动更新旧版含网站段落标记的正文缓存，插图缓存继续复用。只有新章节成功抓取才替换旧缓存。
+- 第一次升级后请运行 start.bat 联网更新正文；旧版异常缓存不会直接用于离线打包，更新后可正常离线导出。
+- 保留 local4 的手动广告授权、完成后恢复 headless 功能。
 
 ## local4 广告阅读授权
 - 识别常见 DOM 阅读授权弹窗和阻塞型 JavaScript 广告提示，将其作为人工授权状态处理。

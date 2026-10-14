@@ -337,11 +337,52 @@ class BrowserSession {
       // Site post-load paragraph/font scripts get time to complete; images download separately.
       await Future<void>.delayed(const Duration(seconds: 2));
       if (!verification) await _throwIfReadingPermission();
-      return await evaluate('document.documentElement.outerHTML',
-          const Duration(seconds: 10)) as String;
+      if (verification) {
+        return await evaluate('document.documentElement.outerHTML',
+            const Duration(seconds: 10)) as String;
+      }
+      return await _snapshotReadableHtml();
     } finally {
       await subscription.cancel();
     }
+  }
+
+  // outerHTML includes CSS-hidden bait paragraphs. Export a clone after consulting
+  // live computed styles; never deduplicate by text or modify the site's live DOM.
+  Future<String> _snapshotReadableHtml() async {
+    final result = await evaluate(r'''(() => {
+      const copy = document.documentElement.cloneNode(true);
+      const root = document.querySelector('#acontent') || document.querySelector('.bcontent');
+      if (!root) return {html: copy.outerHTML};
+      const target = copy.querySelector('#acontent') || copy.querySelector('.bcontent');
+      const paragraphs = Array.from(root.querySelectorAll('p'));
+      const copies = Array.from(target.querySelectorAll('p'));
+      const keyed = paragraphs.some(p => Array.from(p.attributes).some(a => /^data-k\d+$/.test(a.name)));
+      if (keyed && Array.from(document.querySelectorAll('link[rel~="stylesheet"]'))
+          .some(link => !link.disabled && !link.sheet)) {
+        return {error: '正文样式尚未加载，无法区分隐藏副本；已停止保存该章，请稍后重试。'};
+      }
+      function hidden(p) {
+        for (let e = p; e && e !== root; e = e.parentElement) {
+          const s = getComputedStyle(e);
+          if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse'
+              || Number(s.opacity) === 0) return true;
+          if (s.transform !== 'none') {
+            const m = new DOMMatrixReadOnly(s.transform);
+            if (m.m11 === 0 && m.m12 === 0 && m.m21 === 0 && m.m22 === 0) return true;
+          }
+        }
+        return false;
+      }
+      paragraphs.forEach((p, i) => {
+        // Lazy illustrations and off-screen text must remain in the book.
+        if (!p.querySelector('img,svg,video') && hidden(p)) copies[i].remove();
+      });
+      target.setAttribute('data-bili-rendered', 'visible-v1');
+      return {html: copy.outerHTML};
+    })()''', const Duration(seconds: 10)) as Map;
+    if (result['error'] != null) throw StateError(result['error'] as String);
+    return result['html'] as String;
   }
 
   void _requirePageStatus(int? status, String url) {

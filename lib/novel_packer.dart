@@ -204,7 +204,20 @@ class NovelPacker {
     logger.i('Chapter: ${chapter.chapterName}, URL: ${chapter.chapterUrl}');
     final url = chapter.chapterUrl ??
         'chapter:${chapter.volume.catalog.novel.id}:${chapter.volume.volumeName}:${chapter.chapterName}';
-    final cached = await cache.readChapter(url);
+    var cached = await cache.readChapter(url);
+    if (cached != null && source is BiliNovelSource) {
+      final old = parse(cached);
+      final hasKeys = old.querySelectorAll('p').any((p) =>
+          p.attributes.keys.any((k) => RegExp(r'^data-k\d+$').hasMatch(k.toString())));
+      if (hasKeys && old.body?.attributes['data-bili-content-version'] != '2') {
+        if (offline) {
+          throw StateError('旧缓存可能含隐藏重复段落，请先使用 start.bat 在线更新该书。'
+              '旧缓存已保留。章节: ${chapter.chapterName}');
+        }
+        console.writeLine('更新旧版正文缓存: ${chapter.chapterName}');
+        cached = null; // Replace only after a successful, visibility-checked fetch.
+      }
+    }
     late Document doc;
     if (cached != null) {
       console.writeLine('使用缓存: ${chapter.chapterName}');

@@ -12,7 +12,7 @@ import 'package:bili_novel_packer/novel_packer.dart';
 import 'package:bili_novel_packer/pack_option.dart';
 
 const String gitUrl = "https://github.com/XiminHu66/bili_novel_packer_folk";
-const String version = "0.2.50-local4";
+const String version = "0.2.50-local5";
 final browser = BrowserSession();
 bool textOnly = false;
 bool offline = false;
@@ -25,7 +25,7 @@ List<LightNovelSource> sources = [
 
 Future<void> main(List<String> args) async {
   if (args.contains('--help')) {
-    print('Bili Novel Packer 0.2.50-local4\n'
+    print('Bili Novel Packer 0.2.50-local5\n'
         '双击运行，或: bili_novel_packer.exe [选项] [小说/章节URL]\n'
         '--text-only  只下载文字，插图不阻塞打包\n'
         '--offline    从缓存打包已有章节（不启动 Chrome）\n'

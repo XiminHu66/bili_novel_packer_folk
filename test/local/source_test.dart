@@ -8,6 +8,11 @@ Chapter chapter() {
   return Chapter('Chapter', 'https://www.bilinovel.com/novel/5340/341307.html', volume);
 }
 void main() {
+  test('unverified keyed paragraphs fail instead of exporting hidden bait', () async {
+    final source = BiliNovelSource(htmlLoader: (_) async =>
+      '<div id="acontent"><p data-k1="">Text</p><p data-k450="">Text</p></div>');
+    await expectLater(source.getNovelChapter(chapter()), throwsStateError);
+  });
   test('fallback .bcontent works when #acontent is absent', () async {
     final source = BiliNovelSource(htmlLoader: (_) async =>
       '<h1 id="atitle">Title</h1><div class="bcontent"><p>One</p><p>Two</p></div>');

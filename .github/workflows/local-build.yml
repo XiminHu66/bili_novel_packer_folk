@@ -40,7 +40,7 @@ jobs:
           Get-FileHash dist/bili_novel_packer.exe -Algorithm SHA256 | Format-List | Out-File dist/SHA256.txt -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
-          name: bili-novel-packer-Windows-local4
+          name: bili-novel-packer-Windows-local5
           path: dist/
           if-no-files-found: error
           retention-days: 30
