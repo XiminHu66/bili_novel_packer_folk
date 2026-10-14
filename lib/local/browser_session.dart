@@ -75,12 +75,19 @@ class BrowserSession {
       'about:blank',
     ]);
     _process!.stdout.drain<void>();
-    _process!.stderr.drain<void>();
+    var startupDiagnostics = '';
+    _process!.stderr.listen((bytes) {
+      startupDiagnostics += utf8.decode(bytes, allowMalformed: true);
+      if (startupDiagnostics.length > 4096) {
+        startupDiagnostics = startupDiagnostics.substring(startupDiagnostics.length - 4096);
+      }
+    });
     try {
-      final deadline = DateTime.now().add(const Duration(seconds: 20));
+      final deadline = DateTime.now().add(const Duration(seconds: 45));
       while (!await activePort.exists()) {
         if (DateTime.now().isAfter(deadline)) {
-          throw TimeoutException('Chrome 启动超时。请关闭下载器专用 Chrome 后重试。');
+          throw TimeoutException('Chrome 启动超时（45 秒）。请关闭下载器专用 Chrome 后重试。'
+              '${startupDiagnostics.isEmpty ? "" : "\nChrome 启动诊断: $startupDiagnostics"}');
         }
         await Future<void>.delayed(const Duration(milliseconds: 200));
       }
@@ -218,6 +225,7 @@ class BrowserSession {
   }
 
   Future<void> prepareLogin(String url) async {
+    stdout.writeln('正在打开 Chrome 验证窗口，请稍候...');
     await start();
     await readHtml(url);
     stdout.writeln('\n已打开下载器专用 Chrome（登录状态保存在本机）。');
