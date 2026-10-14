@@ -174,4 +174,90 @@ void main() {
     }
   }, timeout: const Timeout(Duration(minutes: 3)));
 
+  test('ad permission waits longer than page timeout then survives headless restart', () async {
+    final profile = await Directory.systemTemp.createTemp('bili-ad-gate');
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    var manualPauses = 0;
+    final browser = BrowserSession(profile: profile, headless: true,
+      requestGap: Duration.zero, pageTimeout: const Duration(seconds: 1),
+      permissionHandler: (session, url) async {
+        manualPauses++;
+        // Controlled fixture: this represents the user finishing a required ad.
+        await session.evaluate('''new Promise(resolve => setTimeout(() => {
+          sessionStorage.setItem("readingPermission", "granted");
+          document.querySelector('[role="dialog"]').remove();
+          document.querySelector("#acontent").innerHTML="<p>Authorized chapter</p>";
+          resolve(true);
+        }, 1600))''');
+        await session.restartHeadless(url);
+      });
+    server.listen((request) async {
+      request.response.headers.contentType = ContentType.html;
+      request.response.write('''<html><body><div id="acontent"><p>Authorized chapter</p></div>
+        <script>
+        if (sessionStorage.getItem("readingPermission") !== "granted") {
+          document.querySelector("#acontent").innerHTML="<p>等待阅读授权</p>";
+          const gate=document.createElement("div");
+          gate.setAttribute("role","dialog");
+          gate.style="position:fixed;top:0;left:0;width:400px;height:300px;z-index:2000";
+          gate.textContent="请观看广告获得阅读权限，完成后才能继续";
+          document.body.appendChild(gate);
+        }
+        </script></body></html>''');
+      await request.response.close();
+    });
+    try {
+      await browser.start(mobile: false);
+      final url='http://127.0.0.1:${server.port}/novel/1/3.html';
+      final html=await browser.readHtml(url);
+      expect(html, contains('Authorized chapter'));
+      expect(html, isNot(contains('role="dialog"')));
+      expect(manualPauses, 1);
+      expect(browser.headless, true);
+      expect(await browser.evaluate('sessionStorage.getItem("readingPermission")'), 'granted');
+      expect(await browser.readHtml(url), contains('Authorized chapter'));
+      expect(manualPauses, 1);
+    } finally {
+      await browser.close();
+      await server.close(force:true);
+      await profile.delete(recursive:true);
+    }
+  }, timeout: const Timeout(Duration(minutes:3)));
+
+  test('blocking JavaScript ad prompt is permission state instead of generic timeout', () async {
+    final profile=await Directory.systemTemp.createTemp('bili-ad-dialog');
+    final server=await HttpServer.bind(InternetAddress.loopbackIPv4,0);
+    var manualPauses=0;
+    final browser=BrowserSession(profile:profile,headless:true,requestGap:Duration.zero,
+      pageTimeout:const Duration(seconds:2),
+      permissionHandler:(session,url) async {
+        manualPauses++;
+        await session.command('Page.handleJavaScriptDialog', {'accept':false});
+        await Future<void>.delayed(const Duration(milliseconds:100));
+        // Controlled fixture grant; production asks the user to handle the real website.
+        await session.evaluate('sessionStorage.setItem("readingPermission","granted")');
+        await session.restartHeadless(url);
+      });
+    server.listen((request) async {
+      request.response.headers.contentType=ContentType.html;
+      request.response.write('''<html><body><div id="acontent"><p>Readable</p></div>
+        <script>
+        if (sessionStorage.getItem("readingPermission")!=="granted")
+          alert("请观看广告获得阅读权限");
+        </script></body></html>''');
+      await request.response.close();
+    });
+    try {
+      await browser.start(mobile:false);
+      final html=await browser.readHtml('http://127.0.0.1:${server.port}/novel/1/4.html');
+      expect(html,contains('Readable'));
+      expect(manualPauses,1);
+      expect(browser.headless,true);
+    } finally {
+      await browser.close();
+      await server.close(force:true);
+      await profile.delete(recursive:true);
+    }
+  }, timeout:const Timeout(Duration(minutes:3)));
+
 }

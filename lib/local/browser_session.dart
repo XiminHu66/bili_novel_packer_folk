@@ -14,6 +14,9 @@ class BrowserSession {
   final Duration pageTimeout;
   final Duration resourceGrace;
   String? _activeUrl;
+  bool _dialogGate = false;
+  bool _handlingPermission = false;
+  final Future<void> Function(BrowserSession, String)? permissionHandler;
   WebSocket? _socket;
   Process? _process;
   int _nextId = 0;
@@ -32,6 +35,7 @@ class BrowserSession {
     this.requestGap = const Duration(seconds: 4),
     this.pageTimeout = const Duration(seconds: 35),
     this.resourceGrace = const Duration(seconds: 6),
+    this.permissionHandler,
   }) : profile = profile ?? Directory(p.join(
       Platform.environment['LOCALAPPDATA'] ??
           Platform.environment['HOME'] ?? Directory.current.path,
@@ -127,6 +131,15 @@ class BrowserSession {
             completer.complete(Map<String, dynamic>.from(message['result'] ?? {}));
           }
         } else {
+          if (message['method'] == 'Page.javascriptDialogOpening') {
+            final prompt = message['params']?['message']?.toString() ?? '';
+            _dialogGate = _looksLikeReadingPermission(prompt);
+            if (_dialogGate && headless && !_handlingPermission) {
+              _failPending(_ReadingPermissionRequired());
+            }
+          } else if (message['method'] == 'Page.javascriptDialogClosed') {
+            _dialogGate = false;
+          }
           _captureImageEvent(message);
           _events.add(message);
         }
@@ -214,26 +227,43 @@ class BrowserSession {
   Future<String> readHtml(String url, {bool verification = false}) async {
     _activeUrl = url;
     final attempts = verification ? 1 : 2;
-    for (var attempt = 0; attempt < attempts; attempt++) {
+    var failures = 0;
+    var permissionPauses = 0;
+    while (true) {
       try {
         return await _readHtmlOnce(url, verification: verification);
+      } on _ReadingPermissionRequired {
+        if (verification || _handlingPermission || permissionPauses >= 2) {
+          throw StateError('阅读授权仍未生效。请在网站确认当前章节可阅读；缓存已保留。URL: $url');
+        }
+        permissionPauses++;
+        await _handleReadingPermission(url);
+        // User/ad waiting does not consume a network retry or a page timeout budget.
+        failures = 0;
       } on TimeoutException catch (error) {
+        if (_dialogGate && !verification) {
+          permissionPauses++;
+          if (permissionPauses > 2) rethrow;
+          await _handleReadingPermission(url);
+          continue;
+        }
         try { await command('Page.stopLoading', {}, const Duration(seconds: 5)); }
         catch (_) {}
         try { await command('Runtime.terminateExecution', {}, const Duration(seconds: 3)); }
         catch (_) {}
-        if (attempt + 1 >= attempts) {
+        failures++;
+        if (failures >= attempts) {
           throw TimeoutException('页面自动重试后仍失败。\n$error');
         }
         stdout.writeln('页面暂时超时，自动重试 1 次: $url\n$error');
         await Future<void>.delayed(const Duration(seconds: 3));
       } on _PageNetworkFailure catch (error) {
-        if (attempt + 1 >= attempts) rethrow;
+        failures++;
+        if (failures >= attempts) rethrow;
         stdout.writeln('页面连接暂时失败，自动重试 1 次: $url\n$error');
         await Future<void>.delayed(const Duration(seconds: 3));
       }
     }
-    throw StateError('无法读取页面: $url');
   }
 
   Future<String> _readHtmlOnce(String url, {required bool verification}) async {
@@ -257,10 +287,12 @@ class BrowserSession {
       if (result['errorText'] != null) {
         throw _PageNetworkFailure('页面连接失败: ${result['errorText']}。URL: $url');
       }
+      if (!verification && _dialogGate) throw _ReadingPermissionRequired();
       final loader = result['loaderId'] as String?;
       final deadline = DateTime.now().add(pageTimeout);
       while (loader != null &&
           !(stages[loader]?.contains('DOMContentLoaded') ?? false)) {
+        if (!verification) await _throwIfReadingPermission();
         final status = statuses[loader];
         _requirePageStatus(status, url);
         if (DateTime.now().isAfter(deadline)) {
@@ -270,8 +302,10 @@ class BrowserSession {
       }
       _requirePageStatus(loader == null ? null : statuses[loader], url);
       if (!verification) {
+        await _throwIfReadingPermission();
         final grace = DateTime.now().add(resourceGrace);
         while (!(stages[loader]?.contains('load') ?? false)) {
+          await _throwIfReadingPermission();
           if (await evaluate('document.readyState', const Duration(seconds: 5)) == 'complete') break;
           if (DateTime.now().isAfter(grace)) {
             // Preserve illustration URLs, then release load handlers from hung resources.
@@ -302,6 +336,7 @@ class BrowserSession {
       }
       // Site post-load paragraph/font scripts get time to complete; images download separately.
       await Future<void>.delayed(const Duration(seconds: 2));
+      if (!verification) await _throwIfReadingPermission();
       return await evaluate('document.documentElement.outerHTML',
           const Duration(seconds: 10)) as String;
     } finally {
@@ -319,22 +354,116 @@ class BrowserSession {
     }
   }
 
+  static bool _looksLikeReadingPermission(String text) {
+    final compact = text.replaceAll(RegExp(r'\s+'), '');
+    return RegExp(r'(观看|觀看|播放|看).{0,12}(广告|廣告)', caseSensitive: false)
+        .hasMatch(compact) &&
+        RegExp(r'阅读|閱讀|浏览|瀏覽|权限|權限|解锁|解鎖|继续|繼續|获得|獲得')
+            .hasMatch(compact);
+  }
+
+  Future<bool> hasReadingPermissionGate() async {
+    if (_dialogGate) return true;
+    return await evaluate(r'''(() => {
+      const gateWords = text => {
+        const t = text.replace(/\s+/g, '');
+        return /(观看|觀看|播放|看).{0,12}(广告|廣告)/i.test(t) &&
+          /阅读|閱讀|浏览|瀏覽|权限|權限|解锁|解鎖|继续|繼續|获得|獲得/.test(t);
+      };
+      const visible = element => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' &&
+          element.getAttribute('aria-hidden') !== 'true' && rect.width > 0 && rect.height > 0;
+      };
+      const candidates = document.querySelectorAll(
+        'dialog[open],[role="dialog"],.layui-layer,.swal2-popup,.van-popup,' +
+        '.ant-modal,.el-dialog,.modal,.popup,.dialog,[class*="overlay"],[class*="mask"]');
+      for (const element of candidates) {
+        if (visible(element) && gateWords(element.innerText || element.textContent || '')) return true;
+      }
+      // Custom fixed modals need not use a standard dialog class.
+      for (const element of document.querySelectorAll('body *')) {
+        const text = element.innerText || '';
+        if (text.length > 1500 || !gateWords(text) || !visible(element)) continue;
+        const style = getComputedStyle(element);
+        if (style.position === 'fixed' || Number(style.zIndex) >= 1000) return true;
+      }
+      const content = document.querySelector('#acontent,.bcontent');
+      if (content && visible(content) && (content.innerText || '').length < 1000 &&
+          gateWords(content.innerText || '') &&
+          content.querySelectorAll('p').length < 3) return true;
+      return false;
+    })()''', const Duration(seconds: 5)) == true;
+  }
+
+  Future<void> _throwIfReadingPermission() async {
+    if (await hasReadingPermissionGate()) throw _ReadingPermissionRequired();
+  }
+
+  Future<void> _navigateForVerification(String url) async {
+    _activeUrl = url;
+    try {
+      await command('Page.navigate', {'url': url}, const Duration(seconds: 10));
+    } on TimeoutException {
+      // Keep the browser/video alive; the user is not subject to the download timer.
+      stdout.writeln('验证页面仍在载入，请在 Chrome 中操作，完成后再回到终端。');
+    }
+  }
+
+  Future<void> _confirmReadable(String url) async {
+    while (true) {
+      stdout.writeln('请完成登录或网站要求的广告观看。等待多久都不会触发下载超时。');
+      stdout.writeln('确认原章节已经可阅读后按 Enter 继续；输入 q 保存进度并退出。');
+      if (stdin.readLineSync()?.trim().toLowerCase() == 'q') {
+        throw StateError('用户暂停下载，缓存已保留。');
+      }
+      // Drain Chrome events accumulated while stdin was waiting.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      if (!await hasReadingPermissionGate()) return;
+      stdout.writeln('当前仍检测到阅读授权提示，暂不关闭验证窗口。');
+    }
+  }
+
+  Future<void> _handleReadingPermission(String url) async {
+    if (_handlingPermission) throw _ReadingPermissionRequired();
+    _handlingPermission = true;
+    stdout.writeln('\n检测到观看广告/阅读授权。已暂停下载，当前章节不会标记为完成。');
+    try {
+      if (permissionHandler != null) {
+        await permissionHandler!(this, url);
+        return;
+      }
+      // Decline the headless JS prompt only to hand it over to a visible browser.
+      // This does not grant access or click an advertisement.
+      if (_dialogGate) {
+        try { await command('Page.handleJavaScriptDialog', {'accept': false}); }
+        catch (_) {}
+        _dialogGate = false;
+      }
+      await _restartBrowser(url, nextHeadless: false);
+      await _navigateForVerification(url);
+      stdout.writeln('已打开原章节，请手动完成网站广告授权；广告页可由你自行打开/关闭。');
+      await _confirmReadable(url);
+      await _restartBrowser(url, nextHeadless: true);
+      stdout.writeln('授权确认完成，恢复 headless 下载。');
+    } finally {
+      _handlingPermission = false;
+    }
+  }
+
   Future<void> prepareLogin(String url) async {
     stdout.writeln('正在打开 Chrome 验证窗口，请稍候...');
     await start();
-    await readHtml(url, verification: true);
+    await _navigateForVerification(url);
     stdout.writeln('\n已打开下载器专用 Chrome（登录状态保存在本机）。');
-    stdout.writeln('请在这个窗口登录哔哩轻小说，并完成网页要求的验证。');
     stdout.writeln('普通 Chrome 中 linovelib.com 的登录不会自动转到 bilinovel.com。');
-    stdout.writeln('确认窗口内能正常阅读后，回到这里按 Enter 继续。');
-    stdin.readLineSync();
-    stdout.writeln('验证完成，正在关闭可见窗口并切换后台 headless 下载...');
+    await _confirmReadable(url);
     await restartHeadless(url);
   }
 
-  Future<void> restartHeadless(String url) async {
+  Future<void> _restartBrowser(String url, {required bool nextHeadless}) async {
     final urls = <String>{url, ..._imageByUrl.keys.take(32)};
-    // Preserve session-only cookies in memory when closing the verification window.
     final response = await command('Network.getCookies', {'urls': urls.toList()});
     final cookies = (response['cookies'] as List<dynamic>? ?? []).map((cookie) {
       final source = Map<String, dynamic>.from(cookie as Map);
@@ -345,14 +474,41 @@ class BrowserSession {
           if (source.containsKey(key)) key: source[key],
       };
     }).toList();
+    final origin = Uri.parse(url).origin;
+    var session = <String, String>{};
+    try {
+      final snapshot = await evaluate(r'''(() => ({
+        origin: location.origin,
+        entries: Object.entries(sessionStorage)
+      }))()''', const Duration(seconds: 5));
+      if (snapshot is Map && snapshot['origin'] == origin) {
+        for (final entry in snapshot['entries'] as List<dynamic>) {
+          session[entry[0] as String] = entry[1] as String;
+        }
+      }
+    } catch (_) { /* Cookies/profile remain available if storage is inaccessible. */ }
     final mobile = _mobile;
     await close();
-    headless = true;
+    headless = nextHeadless;
     await start(mobile: mobile);
     if (cookies.isNotEmpty) await command('Network.setCookies', {'cookies': cookies});
-    // Confirm the new browser can render the target before starting the job.
+    if (session.isNotEmpty) {
+      await command('Page.addScriptToEvaluateOnNewDocument', {'source': '''
+        (() => {
+          if (location.origin !== ${jsonEncode(origin)}) return;
+          const entries = ${jsonEncode(session)};
+          for (const [key, value] of Object.entries(entries)) {
+            if (sessionStorage.getItem(key) === null) sessionStorage.setItem(key, value);
+          }
+        })();
+      '''});
+    }
+  }
+
+  Future<void> restartHeadless(String url) async {
+    await _restartBrowser(url, nextHeadless: true);
     await readHtml(url);
-    stdout.writeln('已切换后台下载，不会再显示 Chrome 窗口。');
+    stdout.writeln('已切换后台下载；仅遇到网站要求的人工授权时会暂停打开验证窗口。');
   }
 
   void _captureImageEvent(Map<String, dynamic> event) {
@@ -399,6 +555,21 @@ class BrowserSession {
   }
 
   Future<Uint8List> readImage(String url) async {
+    for (var pause = 0; pause < 3; pause++) {
+      try {
+        await _throwIfReadingPermission();
+        return await _readImageOnce(url);
+      } on _ReadingPermissionRequired {
+        final chapterUrl = _activeUrl;
+        if (pause >= 2 || chapterUrl == null) rethrow;
+        await _handleReadingPermission(chapterUrl);
+        await readHtml(chapterUrl);
+      }
+    }
+    throw StateError('图片阅读授权未生效。');
+  }
+
+  Future<Uint8List> _readImageOnce(String url) async {
     final uri = Uri.parse(url);
     if (!['http', 'https'].contains(uri.scheme)) {
       throw ArgumentError('不支持的图片地址。');
@@ -472,6 +643,7 @@ class BrowserSession {
     _imageByRequest.clear();
     _imageByUrl.clear();
     _lastRequest = null;
+    _dialogGate = false;
     _failPending(StateError('下载器已退出。'));
     final activePort = File(p.join(profile.path, 'DevToolsActivePort'));
     if (await activePort.exists()) await activePort.delete();
@@ -490,4 +662,9 @@ class _PageNetworkFailure implements Exception {
   _PageNetworkFailure(this.message);
   @override
   String toString() => message;
+}
+
+class _ReadingPermissionRequired implements Exception {
+  @override
+  String toString() => '网站要求观看广告或确认阅读授权，下载已暂停。';
 }
