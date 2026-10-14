@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:bili_novel_packer/local/download_cache.dart';
 
 import 'package:bili_novel_packer/assets/assets.dart';
 import 'package:bili_novel_packer/console/console.dart';
@@ -15,11 +16,16 @@ import 'package:bili_novel_packer/util/html_util.dart';
 import 'package:bili_novel_packer/util/sequence.dart';
 import 'package:bili_novel_packer/util/volume_util.dart';
 import 'package:html/dom.dart';
+import 'package:html/parser.dart';
 
 class NovelPacker {
   final LightNovelSource source;
 
-  NovelPacker(this.source);
+  final DownloadCache cache;
+  final bool textOnly;
+  final bool offline;
+  NovelPacker(this.source, {DownloadCache? cache, this.textOnly = false,
+      this.offline = false}) : cache = cache ?? DownloadCache();
 
   Future<void> packVolume({
     required LightNovelSource source,
@@ -37,6 +43,7 @@ class NovelPacker {
 
     Sequence chapterSeq = Sequence();
     Sequence imageSeq = Sequence();
+    try {
     for (var chapter in volume.chapters) {
       var doc = await _resolveChapter(
         chapter: chapter,
@@ -54,6 +61,10 @@ class NovelPacker {
         title: chapter.chapterName,
         chapterContent: html,
       );
+    }
+    } catch (_) {
+      if (chapterSeq.nowVal > 0) packer.pack(partial: true);
+      rethrow;
     }
     // 设置封面
     await _resolveCover(
@@ -123,10 +134,12 @@ class NovelPacker {
       packer.addStylesheet(styleCss());
     }
 
+    try {
     for (Volume volume in option.selectedVolumes) {
       logger.i("开始处理: ${volume.volumeName}");
       console.writeLine("正在处理: ${volume.volumeName}");
       NavPoint volumeNavPoint = NavPoint(volume.volumeName);
+      packer.addNavPoint(volumeNavPoint);
 
       for (var i = 0; i < volume.chapters.length; i++) {
         var chapter = volume.chapters[i];
@@ -153,8 +166,11 @@ class NovelPacker {
           volumeNavPoint.src = name;
         }
       }
-      packer.addNavPoint(volumeNavPoint);
       logger.i("处理完成: ${volume.volumeName}");
+    }
+    } catch (_) {
+      if (chapterSeq.nowVal > 0) packer.pack(partial: true);
+      rethrow;
     }
     packer.pack();
     logger.i("EPUB file: ${packer.absolutePath}");
@@ -182,7 +198,18 @@ class NovelPacker {
     required Sequence imageSeq,
     LightNovelCoverDetector? detector,
   }) async {
-    Document doc = await source.getNovelChapter(chapter);
+    final url = chapter.chapterUrl ??
+        'chapter:${chapter.volume.catalog.novel.id}:${chapter.volume.volumeName}:${chapter.chapterName}';
+    final cached = await cache.readChapter(url);
+    late Document doc;
+    if (cached != null) {
+      console.writeLine('使用缓存: ${chapter.chapterName}');
+      doc = parse(cached);
+    } else {
+      if (offline) throw StateError('离线模式缺少章节: ${chapter.chapterName}');
+      doc = await source.getNovelChapter(chapter);
+      await cache.saveChapter(url, chapter.chapterName, doc.outerHtml);
+    }
     // 处理图片资源
     await _resolveImages(
       doc: doc,
@@ -214,9 +241,14 @@ class NovelPacker {
     required LightNovelCoverDetector? detector,
   }) async {
     List<Element> imgList = doc.querySelectorAll("img");
+    if (textOnly || offline) {
+      for (final image in imgList) { image.remove(); }
+      return;
+    }
     for (var img in imgList) {
       var imageData = await _downloadImage(img);
       if (imageData == null) {
+        img.replaceWith(Element.tag("p")..text = "[插图下载失败，重新运行可补全]");
         continue;
       }
       String imageName = "${imageSeq.next.toString().padLeft(6, '0')}.jpg";
@@ -242,12 +274,16 @@ class NovelPacker {
   }
 
   Future<Uint8List?> _downloadImageByUrl(String url) async {
+    if (textOnly || offline) return null;
     try {
-      Uint8List imageData = await source.getImage(url);
+      final cached = await cache.readImage(url);
+      if (cached != null) return cached;
+      Uint8List imageData = await source.getImage(url).timeout(const Duration(seconds: 90));
       if (imageData.isEmpty) {
         console.writeLine("$url 图片下载失败: 图片下载为空");
         return null;
       }
+      await cache.saveImage(url, imageData);
       return imageData;
     } catch (e) {
       console.writeLine("$url 图片下载失败: $e");

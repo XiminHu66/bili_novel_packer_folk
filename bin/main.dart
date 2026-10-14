@@ -1,3 +1,5 @@
+import 'dart:io';
+import 'package:bili_novel_packer/local/browser_session.dart';
 import 'package:bili_novel_packer/console/console.dart';
 import 'package:bili_novel_packer/console/prompt.dart';
 import 'package:bili_novel_packer/console/selector.dart';
@@ -9,27 +11,77 @@ import 'package:bili_novel_packer/logger.dart';
 import 'package:bili_novel_packer/novel_packer.dart';
 import 'package:bili_novel_packer/pack_option.dart';
 
-const String gitUrl = "https://github.com/Montaro2017/bili_novel_packer";
-const String version = "0.2.49";
+const String gitUrl = "https://github.com/XiminHu66/bili_novel_packer_folk";
+const String version = "0.2.50-local1";
+final browser = BrowserSession();
+bool textOnly = false;
+bool offline = false;
+bool downloadAll = false;
 
 List<LightNovelSource> sources = [
-  BiliNovelSource(),
+  BiliNovelSource(browser: browser),
   WenkuNovelSource(),
 ];
 
-void main(List<String> args) async {
+Future<void> main(List<String> args) async {
+  if (args.contains('--help')) {
+    print('Bili Novel Packer 0.2.50-local1\n'
+        '双击运行，或: bili_novel_packer.exe [选项] [小说/章节URL]\n'
+        '--text-only  只下载文字，插图不阻塞打包\n'
+        '--offline    从缓存打包已有章节（不启动 Chrome）\n'
+        '--all        下载所有分卷并合并\n'
+        '--check URL  仅检查该章节的正文与分页\n'
+        '--help       显示说明\n'
+        '输出在当前目录；登录状态在本机专用 Chrome 目录。');
+    return;
+  }
+  textOnly = args.contains('--text-only');
+  offline = args.contains('--offline');
+  downloadAll = args.contains('--all');
+  sources = [BiliNovelSource(browser: browser, offline: offline), WenkuNovelSource()];
+  final urls = args.where((a) => a.startsWith('https://') || a.startsWith('http://')).toList();
   printWelcome();
-  do {
-    try {
-      await start();
-    } catch (e, stackTrace) {
-      logger.e(e, stackTrace: stackTrace);
-      console.writeLine(e);
-      console.writeLine(stackTrace);
-      console.writeLine("运行出错.($version)");
-      console.writeLine();
+  try {
+    if (args.contains('--check')) {
+      if (urls.length != 1 || offline) {
+        throw ArgumentError('--check 需要一个章节链接，不能与 --offline 合用。');
+      }
+      final source = sources.first as BiliNovelSource;
+      if (!source.supportUrl(urls.single)) throw ArgumentError('不支持的章节链接。');
+      final uri = Uri.parse(urls.single);
+      await browser.prepareLogin(Uri.parse(BiliNovelSource.domain).resolve(uri.path).toString());
+      final doc = await source.checkChapter(urls.single);
+      final count = doc.body?.text.trim().length ?? 0;
+      if (count == 0) throw StateError('章节正文为空。');
+      print('章节检查通过：正文 $count 字符，插图 ${doc.querySelectorAll("img").length} 张。');
+      return;
     }
-  } while (true);
+    if (urls.isNotEmpty) {
+      for (final url in urls) {
+        final source = detectSource(url);
+        if (source == null) throw ArgumentError('不支持的URL: $url');
+        await runOne(url, source, !downloadAll);
+      }
+    } else {
+      while (true) {
+        await start();
+        console.writeLine('继续下载其他小说? 输入 y 继续，其余退出。');
+        if (console.readLine()?.trim().toLowerCase() != 'y') break;
+      }
+    }
+  } catch (error, stack) {
+    logger.e(error, stackTrace: stack);
+    console.writeLine('\n下载停止: $error');
+    console.writeLine('已完成文字和插图保存在缓存中；重新运行可继续。');
+    console.writeLine('若产生 .partial.epub，这是未完成版本，不代表整本已下载。');
+    exitCode = 1;
+    if (urls.isEmpty) {
+      console.writeLine('按 Enter 退出。');
+      console.readLine();
+    }
+  } finally {
+    await browser.close();
+  }
 }
 
 void printWelcome() {
@@ -54,6 +106,10 @@ Future<void> start() async {
 Future<void> runOne(String url, LightNovelSource source, bool manual) async {
   logger.i("URL: $url");
 
+  if (source is BiliNovelSource && !offline && !browser.connected) {
+    final uri = Uri.parse(url);
+    await browser.prepareLogin(Uri.parse(BiliNovelSource.domain).resolve(uri.path).toString());
+  }
   console.writeLine("正在加载数据...");
   var novel = await source.getNovel(url);
   logger.i(novel);
@@ -61,14 +117,14 @@ Future<void> runOne(String url, LightNovelSource source, bool manual) async {
   var catalog = await source.getNovelCatalog(novel);
   PackOption option;
   bool combineVolume;
-  if (manual) {
+  if (manual && !downloadAll) {
     (option, combineVolume) = readPackOption(catalog);
   } else {
     option = PackOption.all(
       addChapterTitle: false,
       selectedVolumes: catalog.volumes,
     );
-    combineVolume = false;
+    combineVolume = downloadAll;
   }
   logger.i("option: $option, combineVolume: $combineVolume");
   await pack(
@@ -99,7 +155,8 @@ List<(String, LightNovelSource)> readUrlSource() {
   do {
     console.writeLine("请输入链接(多个链接使用空格隔开):");
     var input = console.readLine();
-    if (input == null || input.trim() == "") {
+    if (input == null || input.trim().toLowerCase() == "q") return [];
+    if (input.trim() == "") {
       continue;
     }
     input = input.trim();
@@ -172,7 +229,7 @@ Future<void> pack({
   if (combineVolume && option.selectedVolumes.length <= 1) {
     combineVolume = false;
   }
-  var packer = NovelPacker(source);
+  var packer = NovelPacker(source, textOnly: textOnly, offline: offline);
   if (combineVolume) {
     await packer.packCombine(source: source, novel: novel, option: option);
   } else {

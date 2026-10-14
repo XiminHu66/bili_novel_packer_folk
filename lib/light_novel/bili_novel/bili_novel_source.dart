@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:bili_novel_packer/local/browser_session.dart';
+import 'package:bili_novel_packer/local/download_cache.dart';
 
 import 'package:bili_novel_packer/interceptor/logging_interceptor.dart';
 import 'package:bili_novel_packer/interceptor/rate_limit_interceptor.dart';
@@ -47,7 +49,12 @@ class BiliNovelSource implements LightNovelSource {
         },
       );
 
-  BiliNovelSource() {
+  final BrowserSession? browser;
+  final Future<String> Function(String)? htmlLoader;
+  final bool offline;
+  final DownloadCache pageCache;
+  BiliNovelSource({this.browser, this.htmlLoader, this.offline = false,
+      DownloadCache? pageCache}) : pageCache = pageCache ?? DownloadCache() {
     var options = _createBaseOptions();
     _dio = _createTextDio(options);
     _imageDio = _createImageDio(options);
@@ -56,6 +63,9 @@ class BiliNovelSource implements LightNovelSource {
   BaseOptions _createBaseOptions() {
     return BaseOptions(
       baseUrl: domain,
+      connectTimeout: const Duration(seconds: 15),
+      receiveTimeout: const Duration(seconds: 30),
+      sendTimeout: const Duration(seconds: 15),
       headers: {
         "Accept": "*/*",
         "Accept-Language": "zh-CN,zh;q=0.9",
@@ -102,12 +112,15 @@ class BiliNovelSource implements LightNovelSource {
   Future<Novel> getNovel(String url) async {
     String id = _getId(url);
     String actualUrl = "$domain/novel/$id.html";
-    String html = (await _dio.get(actualUrl)).toString();
+    String html = await _readHtml(actualUrl);
+    if (offline) return _parseNovel(actualUrl, id, parse(html));
     try {
-      return _parseNovel(actualUrl, id, parse(html));
+      final novel = _parseNovel(actualUrl, id, parse(html));
+      await pageCache.saveChapter('page:$actualUrl', novel.title, html);
+      return novel;
     } catch (e) {
       logger.e(e);
-      logger.i(html);
+      // Do not log HTML, which may contain account information.
       rethrow;
     }
   }
@@ -149,7 +162,7 @@ class BiliNovelSource implements LightNovelSource {
   @override
   Future<Catalog> getNovelCatalog(Novel novel) async {
     String url = "$domain/novel/${novel.id}/catalog";
-    String html = (await _dio.get(url)).toString();
+    String html = await _readHtml(url);
     var doc = parse(html);
     var catalog = Catalog(novel);
     // 获取卷封面前先处理图片src
@@ -157,13 +170,17 @@ class BiliNovelSource implements LightNovelSource {
 
     var items = _getCatalogItems(url, html, doc);
     _parseCatalogItems(catalog, doc, items);
+    if (catalog.volumes.isEmpty || catalog.volumes.every((v) => v.chapters.isEmpty)) {
+      throw StateError('目录没有可下载章节，请检查网页或更新下载器。');
+    }
+    if (!offline) await pageCache.saveChapter('page:$url', novel.title, html);
     return catalog;
   }
 
   List<Element> _getCatalogItems(String url, String html, Document doc) {
     var items = doc.querySelectorAll(".volume-chapters>li");
     if (items.isEmpty) {
-      logger.i(html);
+      // Do not log HTML, which may contain account information.
       throw "目录获取为空";
     }
     return items;
@@ -236,7 +253,7 @@ class BiliNovelSource implements LightNovelSource {
     if (href == null || href.contains("javascript")) {
       return null;
     }
-    return "$domain$href";
+    return Uri.parse(domain).resolve(href).toString();
   }
 
   @override
@@ -247,11 +264,20 @@ class BiliNovelSource implements LightNovelSource {
     logger.i("");
     logger.i("${chapter.chapterName} ${chapter.chapterUrl}");
     String? nextPageUrl = chapterUrl;
+    final visited = <String>{};
     do {
-      ChapterPage page = await _getChapterPage(nextPageUrl!);
+      if (!visited.add(nextPageUrl!) || visited.length > 100) {
+        throw StateError('章节分页循环或超过 100 页，已停止，避免重复抓取。');
+      }
+      ChapterPage page = await _getChapterPage(nextPageUrl);
       _updateChapterName(chapter, page);
       _appendChapterPage(doc, page);
       nextPageUrl = page.nextPageUrl;
+      if (nextPageUrl != null) {
+        final currentId = Uri.parse(chapterUrl).path.split('/').last.split('.').first.split('_').first;
+        final nextId = Uri.parse(nextPageUrl).path.split('/').last.split('.').first.split('_').first;
+        if (currentId != nextId) throw StateError('分页链接跳到了另一章，已停止以避免错章。');
+      }
     } while (nextPageUrl != null);
 
     return _finalizeChapterDocument(doc);
@@ -359,18 +385,19 @@ class BiliNovelSource implements LightNovelSource {
 
   /// 获取章节一页内容
   Future<ChapterPage> _getChapterPage(String url) async {
-    String html = (await _dio.get(url)).toString();
+    String html = await _readHtml(url);
     var doc = parse(html);
 
     String? title = _getChapterPageTitle(url, doc);
     Element content = _getChapterPageContent(url, html, doc);
-    _ChapterNavigation navigation = _getChapterNavigation(doc);
+    _ChapterNavigation navigation = _getChapterNavigation(doc, url);
     _cleanChapterContent(content);
-    await _restoreChapterContent(doc, content);
+    // Chrome has already executed chapterlog.js; never shuffle the rendered DOM twice.
+    if (browser == null) await _restoreChapterContent(doc, content);
 
     return ChapterPage(
       title: title,
-      content.children,
+      content.children.toList(),
       prevPageUrl: navigation.prevPageUrl,
       nextPageUrl: navigation.nextPageUrl,
       prevChapterUrl: navigation.prevChapterUrl,
@@ -388,21 +415,31 @@ class BiliNovelSource implements LightNovelSource {
   Element _getChapterPageContent(String url, String html, Document doc) {
     Element? content = _contentSelectors
         .map((selector) => doc.querySelector(selector))
+        .whereType<Element>()
         .firstOrNull;
     if (content == null) {
       logger.i("GET $url ERROR");
-      logger.i(html);
-      throw "运行出错，请提交Issues并上传日志文件($logFilePath)，下次运行会清空日志。";
+      // Do not log HTML, which may contain account information.
+      final visible = doc.body?.text ?? '';
+      if (RegExp(r'invalid\s+login|请先登录|請先登入|登录失效|登入失效', caseSensitive: false).hasMatch(visible)
+          || doc.querySelector('input[type="password"]') != null) {
+        throw StateError('登录无效或已过期。请在下载器专用 Chrome 中登录 bilinovel.com，'
+            '确认可阅读该章后重新运行；已完成章节会从缓存恢复。');
+      }
+      throw StateError('网页没有正文，可能是验证、限流或网站结构变化。'
+          '请查看下载器 Chrome 中的当前页面，完成验证后重新运行。URL: $url');
     }
     return content;
   }
 
-  _ChapterNavigation _getChapterNavigation(Document doc) {
+  _ChapterNavigation _getChapterNavigation(Document doc, String url) {
     RegExpMatch? match = _pageUrlRegExp.firstMatch(doc.outerHtml);
     String? prevUrl = match?.group(1);
     String? nextUrl = match?.group(2);
     Element? prev = doc.querySelector("#footlink a.prevlink");
     Element? next = doc.querySelector("#footlink a.nextlink");
+    prevUrl ??= prev?.attributes['href'];
+    nextUrl ??= next?.attributes['href'];
 
     String? prevPage;
     String? nextPage;
@@ -411,17 +448,17 @@ class BiliNovelSource implements LightNovelSource {
 
     if (prev != null && prevUrl != null) {
       if (_isPageLink(prev, _previousPageTexts)) {
-        prevPage = domain + prevUrl;
+        prevPage = Uri.parse(url).resolve(prevUrl).toString();
       } else if (!_isCatalog(prev)) {
-        prevChapter = domain + prevUrl;
+        prevChapter = Uri.parse(url).resolve(prevUrl).toString();
       }
     }
 
     if (next != null && nextUrl != null) {
       if (_isPageLink(next, _nextPageTexts)) {
-        nextPage = domain + nextUrl;
+        nextPage = Uri.parse(url).resolve(nextUrl).toString();
       } else if (!_isCatalog(next)) {
-        nextChapter = domain + nextUrl;
+        nextChapter = Uri.parse(url).resolve(nextUrl).toString();
       }
     }
     if (nextPage == null && nextChapter == null) {
@@ -438,11 +475,11 @@ class BiliNovelSource implements LightNovelSource {
   }
 
   bool _isPageLink(Element? link, Set<String> pageTexts) {
-    return link != null && pageTexts.contains(link.text);
+    return link != null && pageTexts.contains(link.text.trim());
   }
 
   bool _isCatalog(Element? link) {
-    return link != null && link.text == "返回目录";
+    return link != null && {"返回目录", "返回目錄"}.contains(link.text.trim());
   }
 
   void _cleanChapterContent(Element content) {
@@ -527,12 +564,34 @@ class BiliNovelSource implements LightNovelSource {
     }
   }
 
+  Future<String> _readHtml(String url) async {
+    if (offline) {
+      final cached = await pageCache.readChapter('page:$url');
+      if (cached == null) throw StateError('离线模式缺少目录或书籍信息缓存，请先正常下载一次。');
+      return cached;
+    }
+    if (htmlLoader != null) return htmlLoader!(url);
+    if (browser != null) return browser!.readHtml(url);
+    return (await _dio.get<String>(url)).data ?? '';
+  }
+
+  /// Check a single chapter without requesting the full book.
+  Future<Document> checkChapter(String url) async {
+    final id = _getId(url);
+    final uri = Uri.parse(url);
+    final normalized = Uri.parse(domain).resolve(uri.path).toString();
+    final novel = Novel()..id = id..title = '章节检查'..author = ''..status = '';
+    final volume = Volume('', Catalog(novel));
+    return getNovelChapter(Chapter('章节检查', normalized, volume));
+  }
+
   @override
   Future<Uint8List> getImage(String url) {
     if (url.startsWith("data:image")) {
       var data = url.split(",")[1];
       return Future.value(base64.decode(data));
     }
+    if (browser != null) return browser!.readImage(url);
     return _imageDio.get<Uint8List>(url).then((res) => res.data!);
   }
 }

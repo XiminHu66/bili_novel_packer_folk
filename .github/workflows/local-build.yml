@@ -1,0 +1,44 @@
+name: Local Windows download package
+on:
+  push:
+    branches: ['fix/local-browser-download']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - run: dart pub get
+      - name: Analyze
+        run: dart analyze --no-fatal-infos --no-fatal-warnings
+      - name: Regression tests
+        run: dart test test/local --reporter expanded
+      - name: Existing EPUB tests
+        run: dart test test/epub_packer test/util
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - run: dart pub get
+      - name: Compile standalone executable
+        run: |
+          New-Item -ItemType Directory -Force dist
+          dart compile exe bin/main.dart -o dist/bili_novel_packer.exe
+          Copy-Item start.bat,text-only.bat,pack-cached-text.bat,check-example.bat,LOCAL_README.md,LICENSE dist/
+          ./dist/bili_novel_packer.exe --help
+          Get-FileHash dist/bili_novel_packer.exe -Algorithm SHA256 | Format-List | Out-File dist/SHA256.txt -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bili-novel-packer-Windows-local1
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
