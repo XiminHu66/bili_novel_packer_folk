@@ -36,6 +36,8 @@ def validate(root):
                     try: valid = 1 <= int(days) <= 7
                     except (TypeError, ValueError): valid = False
                     if not valid: errors.append(f'{path.name}/{key}: explicit retention-days 1..7 required')
+                    if 'upload-pages-artifact@' in use and str(w.get('path','')).strip() in ('.','./'):
+                        errors.append(f'{path.name}/{key}: Pages must upload a frontend distribution, not the repository root')
                     if re.search(r'Anime1Player|VideoStreamer-Windows|fixture|tool-frontends', str(w.get('name',''))) and str(days) != '1':
                         errors.append(f'{path.name}/{key}: intermediate binaries must retain at most 1 day')
     return errors
