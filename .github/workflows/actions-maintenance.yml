@@ -1,0 +1,29 @@
+name: Bounded artifact maintenance
+'on':
+  push:
+    branches:
+    - master
+    paths:
+    - .github/workflows/actions-maintenance.yml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: artifact-maintenance
+  cancel-in-progress: false
+jobs:
+  cleanup:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+    - uses: actions/checkout@v4
+    - name: Protect releases and clean completed-run copies
+      env:
+        GH_TOKEN: ${{ github.token }}
+        COMPLETED_RUN: ${{ github.event.workflow_run.id }}
+      run: |
+        args=()
+        if [[ -n "$COMPLETED_RUN" ]]; then args+=(--run-id "$COMPLETED_RUN"); fi
+        python3 .github/scripts/actions_maintenance.py --apply "${args[@]}"

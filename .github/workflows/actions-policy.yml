@@ -1,0 +1,30 @@
+name: Actions resource policy
+'on':
+  push:
+    branches:
+    - master
+    paths:
+    - .github/workflows/**
+    - .github/scripts/**
+    - .github/DEVELOPMENT.md
+    - .github/actions-resource-policy.json
+    - AGENTS.md
+  pull_request:
+    paths:
+    - .github/**
+    - .github/actions-resource-policy.json
+    - AGENTS.md
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: actions-policy-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+    - uses: actions/checkout@v4
+    - run: python3 -m pip install PyYAML==6.0.3
+    - run: python3 .github/scripts/actions_policy.py .
